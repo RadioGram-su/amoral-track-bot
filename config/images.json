@@ -1,0 +1,7 @@
+{
+  "smoking": ["smoking-1.jpg", "smoking-2.jpg", "general-1.jpg"],
+  "alcohol": ["alcohol-1.jpg", "alcohol-2.jpg", "general-1.jpg"],
+  "custom": ["general-1.jpg", "general-2.jpg"],
+  "general": ["general-1.jpg", "general-2.jpg", "urge-1.jpg"],
+  "urge": ["urge-1.jpg", "general-2.jpg"]
+}

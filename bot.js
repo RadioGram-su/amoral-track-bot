@@ -21,6 +21,9 @@ const CONFIG_DIR = process.env.BOT_CONFIG_DIR || path.join(ROOT_DIR, "config");
 const STATE_PATH = process.env.BOT_STATE_PATH || path.join(DATA_DIR, "state.json");
 const MOTIVATION = loadConfigJson("motivation.json");
 const REPLACEMENTS = loadConfigJson("replacements.json");
+const ARTICLES = loadConfigJson("articles.json");
+const IMAGES_META = loadConfigJson("images.json");
+const IMAGES_DIR = path.join(CONFIG_DIR, "images");
 
 const HABIT_PRESETS = {
   smoking: {
@@ -106,6 +109,8 @@ async function handleUpdate(update) {
     "📊 Прогресс": "/stats",
     "💬 Мотивация": "/motivation",
     "🚨 SOS /urge": "/urge",
+    "😔 Сорвался": "/relapse",
+    "📚 Статьи": "/articles",
     "➕ Добавить": "/add",
     "⚙️ Настройки": "/settings",
     "❓ Помощь": "/help"
@@ -154,6 +159,11 @@ async function handleUpdate(update) {
 
   if (text.startsWith("/relapse")) {
     await sendMessage(chatId, relapseIntroText(), relapseKeyboard(userId));
+    return;
+  }
+
+  if (text.startsWith("/articles") || text.startsWith("/article")) {
+    await sendMessage(chatId, articlesIntroText(), articlesMenuKeyboard(userId));
     return;
   }
 
@@ -211,6 +221,12 @@ async function handleCallback(callback) {
     return;
   }
 
+  if (data === "menu:relapse") {
+    await answerCallback(callback.id);
+    await sendMessage(chatId, relapseIntroText(), relapseKeyboard(userId));
+    return;
+  }
+
   if (data === "add:menu") {
     await answerCallback(callback.id);
     await sendMessage(chatId, "Выбери, от чего хочешь отказаться:", addHabitKeyboard(userId));
@@ -232,11 +248,67 @@ async function handleCallback(callback) {
     return;
   }
 
-  if (data.startsWith("relapse:")) {
+  if (data === "article:menu") {
+    await answerCallback(callback.id);
+    await sendMessage(chatId, articlesIntroText(), articlesMenuKeyboard(userId));
+    return;
+  }
+
+  if (data.startsWith("article:pick:")) {
+    const habitId = data.split(":")[2];
+    const habit = getHabit(userId, habitId);
+    await answerCallback(callback.id);
+    if (!habit) {
+      await sendMessage(chatId, "Привычка не найдена.", articlesMenuKeyboard(userId));
+      return;
+    }
+    await sendMessage(chatId, `${habit.emoji} **${habit.name}** — выбери тему:`, articleTopicsKeyboard(habitId));
+    return;
+  }
+
+  if (data.startsWith("article:") && data.split(":").length === 3) {
+    const [, habitId, section] = data.split(":");
+    const habit = getHabit(userId, habitId);
+    await answerCallback(callback.id);
+    if (!habit) {
+      await sendMessage(chatId, "Привычка не найдена.", articlesMenuKeyboard(userId));
+      return;
+    }
+    const text = articleText(habit, section, state.users[userId].timezoneOffset);
+    await sendMessage(chatId, text, articleTopicsKeyboard(habitId));
+    return;
+  }
+
+  if (data.startsWith("relapse:") && !data.startsWith("relapse:confirm:")) {
     const habitId = data.split(":")[1];
+    const habit = getHabit(userId, habitId);
+    await answerCallback(callback.id);
+    if (!habit) return;
+    await sendMessage(
+      chatId,
+      `${habit.emoji} **${habit.name}**\n\nСорвался? Счётчик обнулится, новый цикл начнётся **сегодня**.\n\nЭто не провал — это честный перезапуск.`,
+      relapseConfirmKeyboard(habitId)
+    );
+    return;
+  }
+
+  if (data.startsWith("relapse:confirm:")) {
+    const habitId = data.split(":")[2];
+    const habit = getHabit(userId, habitId);
+    if (!habit) {
+      await answerCallback(callback.id);
+      return;
+    }
+    const prevDays = habitStats(habit, state.users[userId].timezoneOffset).days;
     logRelapse(userId, habitId);
-    await answerCallback(callback.id, "Записал. Это не конец пути.");
-    await sendMessage(chatId, relapseSupportText(userId, habitId), mainKeyboard());
+    await answerCallback(callback.id, "Счётчик обнулён");
+    await sendMotivationWithImage(
+      chatId,
+      relapseSupportText(userId, habitId, prevDays),
+      habit.type,
+      "urge",
+      mainKeyboard()
+    );
     return;
   }
 
@@ -417,14 +489,16 @@ function toggleReminderSlot(userId, slot) {
 async function sendMotivation(chatId, userId, source) {
   const user = state.users[userId];
   if (!user.habits.length) {
-    await sendMessage(chatId, "Сначала добавь привычку для отслеживания.", addHabitKeyboard(userId));
+    await sendMessage(chatId, "Сначала добавь привычку для отслеживания.", addHabitKeyboard());
     return;
   }
 
   const habit = pickRandom(user.habits);
   const slot = source === "manual" ? currentSlot(user.timezoneOffset) : source;
-  const text = pickMotivation(habit.type, slot, habit, user.timezoneOffset);
-  await sendMessage(chatId, `${habit.emoji} ${habit.name}\n\n${text}`, mainKeyboard());
+  const motivation = pickMotivation(habit.type, slot, habit, user.timezoneOffset);
+  const percentile = percentileLine(habit, user.timezoneOffset);
+  const caption = `${habit.emoji} **${habit.name}**\n\n${motivation}\n\n${percentile}`;
+  await sendMotivationWithImage(chatId, caption, habit.type, slot, mainKeyboard());
 }
 
 async function sendUrgeHelp(chatId, userId) {
@@ -435,17 +509,15 @@ async function sendUrgeHelp(chatId, userId) {
     : pickFrom(MOTIVATION.general.urge);
   const replacement = pickReplacement(habit?.type || "general");
 
-  await sendMessage(
-    chatId,
-    `🚨 **Сильное желание — это нормально.**\n\n${motivation}\n\n🔄 **Замени привычку на:**\n${replacement}`,
-    {
-      inline_keyboard: [
-        [{ text: "🔄 Ещё замена", callback_data: "replace:more" }],
-        [{ text: "📊 Мой прогресс", callback_data: "menu:stats" }],
-        [{ text: "💬 Ещё мотивация", callback_data: "menu:motivation" }]
-      ]
-    }
-  );
+  const caption = `🚨 **Сильное желание — это нормально.**\n\n${motivation}\n\n🔄 **Замени привычку на:**\n${replacement}`;
+  await sendMotivationWithImage(chatId, caption, habit?.type || "general", "urge", {
+    inline_keyboard: [
+      [{ text: "🔄 Ещё замена", callback_data: "replace:more" }],
+      [{ text: "📊 Мой прогресс", callback_data: "menu:stats" }],
+      [{ text: "📚 Статьи", callback_data: "article:menu" }],
+      [{ text: "😔 Сорвался", callback_data: "menu:relapse" }]
+    ]
+  });
 }
 
 async function sendReplacement(chatId, userId) {
@@ -504,6 +576,7 @@ function statsText(userId) {
         stats.savedUnits > 0 ? `📉 Не потреблено: ~**${stats.savedUnits}** ${habit.unitLabel}` : null,
         stats.savedMoney > 0 ? `💰 Сэкономлено: ~**${stats.savedMoney} ₽**` : null,
         stats.relapseCount > 0 ? `⚠️ Срывов записано: ${stats.relapseCount}` : null,
+        percentileLine(habit, user.timezoneOffset),
         `🗓 Старт текущего цикла: ${formatDate(habit.quitDate)}`
       ]
         .filter(Boolean)
@@ -573,6 +646,8 @@ function startText(userId) {
     "• присылаю мотивацию утром, днём и вечером",
     "• помогаю в момент сильного желания (/urge)",
     "• предлагаю **здоровые замены**",
+    "• **статьи**: польза, синдромы, как справиться",
+    "• сравнение: **лучше X% людей** на твоём этапе",
     "",
     "⚠️ Я не заменяю врача. При тяжёой зависимости — обратись к специалисту."
   ];
@@ -591,7 +666,8 @@ function helpText() {
     "/motivation — мотивация сейчас",
     "/urge — сильное желание, SOS-помощь",
     "/habits — список привычек",
-    "/relapse — честно записать срыв",
+    "/relapse — сорвался, обнулить счётчик",
+    "/articles — статьи по привычкам",
     "/settings — напоминания и часовой пояс",
     "/help — эта справка",
     "",
@@ -600,26 +676,109 @@ function helpText() {
 }
 
 function relapseIntroText() {
-  return "⚠️ Срыв случается. Это не конец пути.\n\nВыбери привычку — я запишу и помогу вернуться в строй. Streak начнётся заново, но опыт останется.";
+  return "😔 **Сорвался?**\n\nВыбери привычку — **обнулю счётчик**, новый streak начнётся с **сегодня**.\n\nЭто не конец. Честность с собой — уже сила.";
 }
 
-function relapseSupportText(userId, habitId) {
+function relapseSupportText(userId, habitId, prevDays = 0) {
   const habit = getHabit(userId, habitId);
   if (!habit) return "Записал. Дыши. Ты можешь начать снова прямо сейчас.";
   return [
     `${habit.emoji} **${habit.name}** — срыв записан.`,
+    prevDays > 0 ? `📉 Streak **${prevDays}** ${pluralDays(prevDays)} обнулён. Новый старт: **сегодня**.` : "🔄 Счётчик обнулён. Новый старт: **сегодня**.",
     "",
     pickMotivation(habit.type, "urge", habit, state.users[userId].timezoneOffset),
     "",
-    "🔄 Новый цикл начался сегодня. Один срыв не определяет тебя."
+    "💪 Один срыв не стирает весь путь. Ты уже знаешь, что можешь."
   ].join("\n");
+}
+
+function articlesIntroText() {
+  return "📚 **Статьи по привычкам**\n\nВыбери привычку — расскажу про:\n• пользу отказа\n• экономию\n• синдромы по дням\n• как справляться с тягой";
+}
+
+function articleText(habit, section, timezoneOffset) {
+  const type = ARTICLES[habit.type] ? habit.type : "custom";
+  const block = ARTICLES[type];
+  let text = block[section] || block.benefits;
+  if (section === "savings") {
+    const stats = habitStats(habit, timezoneOffset);
+    text += `\n\n📊 **Твоя статистика:** ~**${stats.savedMoney} ₽**`;
+    if (stats.savedUnits > 0) text += ` · **${stats.savedUnits}** ${habit.unitLabel}`;
+    text += ` за **${stats.days}** ${pluralDays(stats.days)}.`;
+  }
+  return text;
+}
+
+function getSurvivalPercent(habitType, days) {
+  const table = ARTICLES.survival_percent[habitType] || ARTICLES.survival_percent.custom;
+  const keys = Object.keys(table).map(Number).sort((a, b) => a - b);
+  let percent = table[String(keys[0])] || 50;
+  for (const key of keys) {
+    if (days >= key) percent = table[String(key)];
+  }
+  return percent;
+}
+
+function percentileLine(habit, timezoneOffset) {
+  const stats = habitStats(habit, timezoneOffset);
+  if (stats.days === 0) return "🚀 **Старт сегодня** — каждый день без срыва поднимает тебя выше среднего.";
+  const type = ARTICLES[habit.type] ? habit.type : "custom";
+  const percent = getSurvivalPercent(type, stats.days);
+  return `🏅 Ты держишься **лучше ~${percent}%** людей, которые пробуют бросить на этом этапе.`;
+}
+
+function pickImageName(habitType, slot) {
+  const pool = [
+    ...asArray(IMAGES_META[habitType]),
+    ...asArray(IMAGES_META[slot]),
+    ...asArray(IMAGES_META.general)
+  ].filter(Boolean);
+  return pickRandom(pool.length ? pool : null);
+}
+
+function resolveImagePath(fileName) {
+  if (!fileName) return null;
+  const candidates = [
+    path.join(IMAGES_DIR, fileName),
+    path.join(ROOT_DIR, "images", fileName),
+    path.join(ROOT_DIR, "data", fileName)
+  ];
+  return candidates.find((filePath) => fs.existsSync(filePath)) || null;
+}
+
+async function sendMotivationWithImage(chatId, caption, habitType, slot, replyMarkup) {
+  const imageName = pickImageName(habitType, slot);
+  const imagePath = resolveImagePath(imageName);
+  if (imagePath) return sendPhotoFile(chatId, imagePath, caption, replyMarkup);
+  return sendMessage(chatId, caption, replyMarkup);
+}
+
+async function sendPhotoFile(chatId, imagePath, caption, replyMarkup) {
+  if (SELF_TEST) return sendMessage(chatId, caption, replyMarkup);
+
+  const buffer = fs.readFileSync(imagePath);
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append("photo", new Blob([buffer], { type: "image/jpeg" }), path.basename(imagePath));
+  form.append("caption", caption.slice(0, 1024));
+  form.append("parse_mode", "Markdown");
+  if (replyMarkup) form.append("reply_markup", JSON.stringify(replyMarkup));
+
+  const response = await fetch(`${telegramApi}/sendPhoto`, { method: "POST", body: form });
+  const data = await response.json();
+  if (!data.ok) {
+    console.error("sendPhoto failed:", data.description);
+    return sendMessage(chatId, caption, replyMarkup);
+  }
+  return data;
 }
 
 function mainKeyboard() {
   return {
     keyboard: [
       [{ text: "📊 Прогресс" }, { text: "💬 Мотивация" }],
-      [{ text: "🚨 SOS /urge" }, { text: "➕ Добавить" }],
+      [{ text: "🚨 SOS /urge" }, { text: "😔 Сорвался" }],
+      [{ text: "📚 Статьи" }, { text: "➕ Добавить" }],
       [{ text: "⚙️ Настройки" }, { text: "❓ Помощь" }]
     ],
     resize_keyboard: true
@@ -630,8 +789,43 @@ function statsKeyboard(userId) {
   return {
     inline_keyboard: [
       [{ text: "💬 Мотивация", callback_data: "menu:motivation" }],
+      [{ text: "📚 Статьи", callback_data: "article:menu" }],
       [{ text: "🚨 SOS", callback_data: "menu:urge" }],
+      [{ text: "😔 Сорвался", callback_data: "menu:relapse" }],
       [{ text: "➕ Добавить привычку", callback_data: "add:menu" }]
+    ]
+  };
+}
+
+function articlesMenuKeyboard(userId) {
+  const user = state.users[userId];
+  if (!user.habits.length) {
+    return { inline_keyboard: [[{ text: "➕ Добавить привычку", callback_data: "add:menu" }]] };
+  }
+  const rows = user.habits.map((habit) => [
+    { text: `${habit.emoji} ${habit.name}`, callback_data: `article:pick:${habit.id}` }
+  ]);
+  rows.push([{ text: "← Главное меню", callback_data: "menu:main" }]);
+  return { inline_keyboard: rows };
+}
+
+function articleTopicsKeyboard(habitId) {
+  return {
+    inline_keyboard: [
+      [{ text: "🌿 Польза отказа", callback_data: `article:${habitId}:benefits` }],
+      [{ text: "💰 Экономия", callback_data: `article:${habitId}:savings` }],
+      [{ text: "🧠 Синдромы по дням", callback_data: `article:${habitId}:withdrawal` }],
+      [{ text: "🛡 Как справиться", callback_data: `article:${habitId}:cravings` }],
+      [{ text: "← К привычкам", callback_data: "article:menu" }]
+    ]
+  };
+}
+
+function relapseConfirmKeyboard(habitId) {
+  return {
+    inline_keyboard: [
+      [{ text: "✅ Да, обнулить счётчик", callback_data: `relapse:confirm:${habitId}` }],
+      [{ text: "❌ Нет, держусь!", callback_data: "menu:main" }]
     ]
   };
 }
@@ -710,13 +904,10 @@ async function tickReminders() {
       saveState();
 
       const habit = pickRandom(user.habits);
-      const text = pickMotivation(habit.type, slot, habit, user.timezoneOffset);
+      const motivation = pickMotivation(habit.type, slot, habit, user.timezoneOffset);
+      const caption = `🔔 ${slotLabel(slot)}\n\n${habit.emoji} ${habit.name}\n\n${motivation}\n\n${percentileLine(habit, user.timezoneOffset)}`;
       try {
-        await sendMessage(
-          user.chatId,
-          `🔔 ${slotLabel(slot)}\n\n${habit.emoji} ${habit.name}\n\n${text}`,
-          mainKeyboard()
-        );
+        await sendMotivationWithImage(user.chatId, caption, habit.type, slot, mainKeyboard());
       } catch (error) {
         console.error(`Reminder failed for ${userId}:`, error.message);
       }
@@ -895,5 +1086,7 @@ async function runSelfTest() {
   console.log("\nMotivation morning:\n", pickMotivation("smoking", "morning", habit, 3));
   console.log("\nUrge:\n", pickMotivation("smoking", "urge", habit, 3));
   console.log("\nReplacement:\n", pickReplacement("smoking"));
+  console.log("\nPercentile:\n", percentileLine(habit, 3));
+  console.log("\nArticle:\n", articleText(habit, "benefits", 3).slice(0, 120) + "...");
   console.log("\nSelf-test OK");
 }

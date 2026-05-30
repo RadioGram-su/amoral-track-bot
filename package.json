@@ -1,10 +1,12 @@
 {
   "name": "amoral-track-bot",
   "version": "1.0.0",
-  "description": "Telegram habit tracker bot",
+  "description": "Telegram habit tracker bot — quit smoking, alcohol, daily motivation",
   "main": "bot.js",
   "scripts": {
-    "start": "node bot.js"
+    "start": "node bot.js",
+    "check": "node --check bot.js",
+    "self-test": "node bot.js --self-test"
   },
   "engines": {
     "node": ">=18"

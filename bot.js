@@ -16,9 +16,11 @@ const REMINDER_HOURS = {
 };
 
 const ROOT_DIR = __dirname;
-const STATE_PATH = process.env.BOT_STATE_PATH || path.join(ROOT_DIR, "data", "state.json");
-const MOTIVATION = loadJson(path.join(ROOT_DIR, "data", "motivation.json"));
-const REPLACEMENTS = loadJson(path.join(ROOT_DIR, "data", "replacements.json"));
+const DATA_DIR = process.env.BOT_DATA_DIR || process.env.DATA_DIR || path.join(ROOT_DIR, "data");
+const CONFIG_DIR = process.env.BOT_CONFIG_DIR || path.join(ROOT_DIR, "config");
+const STATE_PATH = process.env.BOT_STATE_PATH || path.join(DATA_DIR, "state.json");
+const MOTIVATION = loadConfigJson("motivation.json");
+const REPLACEMENTS = loadConfigJson("replacements.json");
 
 const HABIT_PRESETS = {
   smoking: {
@@ -800,6 +802,17 @@ function saveState() {
 
 function loadJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
+}
+
+function loadConfigJson(name) {
+  const candidates = [
+    path.join(CONFIG_DIR, name),
+    path.join(ROOT_DIR, "data", name)
+  ];
+  for (const filePath of candidates) {
+    if (fs.existsSync(filePath)) return loadJson(filePath);
+  }
+  throw new Error(`Missing config file: ${name}`);
 }
 
 function todayKey(timezoneOffset = 3) {

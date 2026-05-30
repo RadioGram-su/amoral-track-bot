@@ -5,6 +5,9 @@ const http = require("http");
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "";
 const PORT = Number(process.env.PORT || 8788);
+const RADIO_GRAM_URL = process.env.RADIO_GRAM_URL || "https://player.radiogram.su/";
+const CHANNEL_URL = process.env.CHANNEL_URL || "https://t.me/gramradiochill";
+const SUPPORT_URL = process.env.SUPPORT_URL || "https://pay.cloudtips.ru/p/b5dba7c2";
 const SELF_TEST = process.argv.includes("--self-test");
 
 const DEFAULT_REMINDER_SLOTS = ["morning", "midday", "evening"];
@@ -23,6 +26,7 @@ const MOTIVATION = loadConfigJson("motivation.json");
 const REPLACEMENTS = loadConfigJson("replacements.json");
 const ARTICLES = loadConfigJson("articles.json");
 const IMAGES_META = loadConfigJson("images.json");
+const SAVINGS_IDEAS = loadConfigJson("savings-ideas.json");
 const IMAGES_DIR = path.join(CONFIG_DIR, "images");
 
 const HABIT_PRESETS = {
@@ -33,6 +37,7 @@ const HABIT_PRESETS = {
     dailyAmount: 20,
     unitLabel: "сигарет",
     unitCost: 250,
+    moneyPerDay: 250,
     costLabel: "₽/пачка"
   },
   alcohol: {
@@ -42,6 +47,27 @@ const HABIT_PRESETS = {
     dailyAmount: 1,
     unitLabel: "порций",
     unitCost: 500,
+    moneyPerDay: 500,
+    costLabel: "₽/день"
+  },
+  masturbation: {
+    type: "masturbation",
+    name: "Онанизм / порно",
+    emoji: "🧠",
+    dailyAmount: 1,
+    unitLabel: "раз",
+    unitCost: 0,
+    moneyPerDay: 0,
+    costLabel: "₽/день"
+  },
+  junkfood: {
+    type: "junkfood",
+    name: "Вредная еда",
+    emoji: "🍔",
+    dailyAmount: 2,
+    unitLabel: "перекусов",
+    unitCost: 400,
+    moneyPerDay: 400,
     costLabel: "₽/день"
   }
 };
@@ -112,6 +138,8 @@ async function handleUpdate(update) {
     "😔 Сорвался": "/relapse",
     "📚 Статьи": "/articles",
     "➕ Добавить": "/add",
+    "🗑 Удалить": "/delete",
+    "🎧 Радио & музыка": "/links",
     "⚙️ Настройки": "/settings",
     "❓ Помощь": "/help"
   };
@@ -119,6 +147,7 @@ async function handleUpdate(update) {
 
   if (text.startsWith("/start")) {
     await sendMessage(chatId, startText(userId), mainKeyboard());
+    await sendMessage(chatId, linksIntroText(), linksKeyboard());
     return;
   }
 
@@ -147,8 +176,11 @@ async function handleUpdate(update) {
     return;
   }
 
-  if (text.startsWith("/habits")) {
-    await sendMessage(chatId, habitsText(userId), habitsKeyboard(userId));
+  if (text.startsWith("/habits") || text.startsWith("/delete") || text.startsWith("/remove")) {
+    const intro = text.startsWith("/delete") || text.startsWith("/remove")
+      ? deleteHabitIntroText()
+      : habitsText(userId);
+    await sendMessage(chatId, intro, habitsKeyboard(userId));
     return;
   }
 
@@ -164,6 +196,11 @@ async function handleUpdate(update) {
 
   if (text.startsWith("/articles") || text.startsWith("/article")) {
     await sendMessage(chatId, articlesIntroText(), articlesMenuKeyboard(userId));
+    return;
+  }
+
+  if (text.startsWith("/links") || text.startsWith("/radio")) {
+    await sendMessage(chatId, linksIntroText(), linksKeyboard());
     return;
   }
 
@@ -184,6 +221,12 @@ async function handleCallback(callback) {
   const chatId = callback.message.chat.id;
   const userId = String(callback.from.id);
   ensureUser(userId, chatId);
+
+  if (data === "menu:links") {
+    await answerCallback(callback.id);
+    await sendMessage(chatId, linksIntroText(), linksKeyboard());
+    return;
+  }
 
   if (data === "menu:main") {
     await answerCallback(callback.id);
@@ -240,11 +283,29 @@ async function handleCallback(callback) {
     return;
   }
 
-  if (data.startsWith("remove:")) {
+  if (data.startsWith("remove:") && data.split(":").length === 2) {
     const habitId = data.split(":")[1];
+    const habit = getHabit(userId, habitId);
+    await answerCallback(callback.id);
+    if (!habit) {
+      await sendMessage(chatId, "Привычка не найдена.", habitsKeyboard(userId));
+      return;
+    }
+    await sendMessage(
+      chatId,
+      `🗑 **Удалить привычку?**\n\n${habit.emoji} **${habit.name}**\n\nСтатистика и streak по ней **исчезнут**. Это нельзя отменить.`,
+      deleteConfirmKeyboard(habitId)
+    );
+    return;
+  }
+
+  if (data.startsWith("remove:confirm:")) {
+    const habitId = data.split(":")[2];
+    const habit = getHabit(userId, habitId);
+    const name = habit ? `${habit.emoji} ${habit.name}` : "Привычка";
     removeHabit(userId, habitId);
-    await answerCallback(callback.id, "Привычка удалена");
-    await sendMessage(chatId, habitsText(userId), habitsKeyboard(userId));
+    await answerCallback(callback.id, "Удалено");
+    await sendMessage(chatId, `✅ ${name} удалена из трекера.`, mainKeyboard());
     return;
   }
 
@@ -367,24 +428,26 @@ async function handleAwaitingInput(userId, chatId, text) {
     const dailyAmount = Math.max(0, Number(text.replace(",", ".")) || 0);
     state.users[userId].awaitingInput = { type: "custom_unit_cost", name: pending.name, dailyAmount };
     saveState();
-    await sendMessage(chatId, "Сколько ₽ тратишь в день на эту привычку? (число, или 0)");
+    await sendMessage(chatId, "💰 **Сколько ₽ в день** тратишь на эту привычку?\n(Запомню один раз. Напиши число или 0)");
     return;
   }
 
   if (pending.type === "custom_unit_cost") {
-    const unitCost = Math.max(0, Number(text.replace(",", ".")) || 0);
+    const moneyPerDay = Math.max(0, Number(text.replace(",", ".")) || 0);
     addHabit(userId, {
       type: "custom",
       name: pending.name,
       emoji: "🎯",
       dailyAmount: pending.dailyAmount,
-      unitCost,
+      moneyPerDay,
+      unitCost: moneyPerDay,
       unitLabel: "раз",
       costLabel: "₽/день"
     });
     state.users[userId].awaitingInput = null;
     saveState();
-    await sendMessage(chatId, `✅ Добавлено: ${pending.name}\n\n${statsText(userId)}`, mainKeyboard());
+    const moneyLine = moneyPerDay ? `\n💰 Расход: **${moneyPerDay} ₽/день**` : "";
+    await sendMessage(chatId, `✅ Добавлено: **${pending.name}**${moneyLine}\n\n${statsText(userId)}`, mainKeyboard());
     return;
   }
 
@@ -394,16 +457,41 @@ async function handleAwaitingInput(userId, chatId, text) {
     const dailyAmount = normalized === "ок" || normalized === "ok"
       ? pending.defaultAmount
       : Math.max(1, parsed || pending.defaultAmount);
+    const preset = HABIT_PRESETS[pending.presetType];
+    const defaultMoney = suggestMoneyPerDay(preset, dailyAmount);
+    state.users[userId].awaitingInput = {
+      type: "preset_money_per_day",
+      presetType: pending.presetType,
+      dailyAmount,
+      defaultMoney
+    };
+    saveState();
+    await sendMessage(
+      chatId,
+      `${preset.emoji} **${preset.name}**\n\n💰 **Сколько ₽ в день** ты тратишь на это?\n(Запомню один раз.)\n\nПодсказка: ~**${defaultMoney} ₽/день**\nНапиши число или «ок» для подсказки.`
+    );
+    return;
+  }
+
+  if (pending.type === "preset_money_per_day") {
+    const normalized = text.toLowerCase();
+    const parsed = Number(text.replace(",", "."));
+    const moneyPerDay = normalized === "ок" || normalized === "ok"
+      ? pending.defaultMoney
+      : Math.max(0, parsed || pending.defaultMoney);
     addHabit(userId, {
       ...HABIT_PRESETS[pending.presetType],
-      dailyAmount
+      dailyAmount: pending.dailyAmount,
+      moneyPerDay,
+      unitCost: moneyPerDay
     });
     state.users[userId].awaitingInput = null;
     saveState();
     const preset = HABIT_PRESETS[pending.presetType];
+    const habit = getHabitByType(userId, preset.type);
     await sendMessage(
       chatId,
-      `✅ Отслеживаем: ${preset.emoji} ${preset.name}\nСтарт: сегодня\n\n${pickMotivation(preset.type, "morning", getHabitByType(userId, preset.type), state.users[userId].timezoneOffset)}`,
+      `✅ **${preset.name}** — старт!\n💰 Расход: **${moneyPerDay} ₽/день**\n\n${statsText(userId)}\n\n${pickMotivation(preset.type, "morning", habit, state.users[userId].timezoneOffset)}`,
       mainKeyboard()
     );
     return;
@@ -448,14 +536,17 @@ function addHabit(userId, config) {
   ensureUser(userId);
   const user = state.users[userId];
   const id = config.type === "custom" ? `custom-${Date.now()}` : config.type;
+  const nowIso = new Date().toISOString();
   user.habits.push({
     id,
     type: config.type,
     name: config.name,
     emoji: config.emoji || "🎯",
     quitDate: todayKey(user.timezoneOffset),
+    quitAt: nowIso,
     dailyAmount: config.dailyAmount || 1,
-    unitCost: config.unitCost ?? HABIT_PRESETS[config.type]?.unitCost ?? 0,
+    moneyPerDay: config.moneyPerDay ?? config.unitCost ?? HABIT_PRESETS[config.type]?.moneyPerDay ?? 0,
+    unitCost: config.unitCost ?? config.moneyPerDay ?? HABIT_PRESETS[config.type]?.unitCost ?? 0,
     unitLabel: config.unitLabel || HABIT_PRESETS[config.type]?.unitLabel || "раз",
     relapses: [],
     lastMotivationSlot: {}
@@ -473,7 +564,9 @@ function logRelapse(userId, habitId) {
   const habit = getHabit(userId, habitId);
   if (!habit) return;
   habit.relapses.push({ at: new Date().toISOString() });
+  const nowIso = new Date().toISOString();
   habit.quitDate = todayKey(state.users[userId].timezoneOffset);
+  habit.quitAt = nowIso;
   saveState();
 }
 
@@ -496,8 +589,8 @@ async function sendMotivation(chatId, userId, source) {
   const habit = pickRandom(user.habits);
   const slot = source === "manual" ? currentSlot(user.timezoneOffset) : source;
   const motivation = pickMotivation(habit.type, slot, habit, user.timezoneOffset);
-  const percentile = percentileLine(habit, user.timezoneOffset);
-  const caption = `${habit.emoji} **${habit.name}**\n\n${motivation}\n\n${percentile}`;
+  const statsBlock = relapseStatLine(habit, user.timezoneOffset);
+  const caption = `${habit.emoji} **${habit.name}**\n\n${motivation}\n\n${statsBlock}`;
   await sendMotivationWithImage(chatId, caption, habit.type, slot, mainKeyboard());
 }
 
@@ -543,7 +636,9 @@ function pickMotivation(habitType, slot, habit, timezoneOffset = 3) {
   message = message
     .replaceAll("{days}", String(stats.days))
     .replaceAll("{savedMoney}", String(stats.savedMoney))
-    .replaceAll("{savedUnits}", String(stats.savedUnits));
+    .replaceAll("{savedUnits}", String(stats.savedUnits))
+    .replaceAll("{elapsed}", formatElapsed(stats.elapsed))
+    .replaceAll("{savingsIdea}", pickSavingsIdea(stats.savedMoney, habit.type));
 
   const milestone = MOTIVATION[habitType]?.milestones?.[String(stats.days)];
   if (milestone) message = `${milestone}\n\n${message}`;
@@ -570,14 +665,13 @@ function statsText(userId) {
       const stats = habitStats(habit, user.timezoneOffset);
       return [
         `${habit.emoji} **${habit.name}**`,
-        `📅 Без срыва: **${stats.days}** ${pluralDays(stats.days)}`,
+        relapseStatLine(habit, user.timezoneOffset),
         `🔥 Текущий streak: **${stats.currentStreak}** ${pluralDays(stats.currentStreak)}`,
         `🏆 Лучший streak: **${stats.bestStreak}** ${pluralDays(stats.bestStreak)}`,
         stats.savedUnits > 0 ? `📉 Не потреблено: ~**${stats.savedUnits}** ${habit.unitLabel}` : null,
-        stats.savedMoney > 0 ? `💰 Сэкономлено: ~**${stats.savedMoney} ₽**` : null,
+        formatSavingsBlock(habit, stats),
         stats.relapseCount > 0 ? `⚠️ Срывов записано: ${stats.relapseCount}` : null,
-        percentileLine(habit, user.timezoneOffset),
-        `🗓 Старт текущего цикла: ${formatDate(habit.quitDate)}`
+        `🗓 Старт цикла: ${formatDateTime(habit.quitAt || habit.quitDate)}`
       ]
         .filter(Boolean)
         .join("\n");
@@ -586,9 +680,12 @@ function statsText(userId) {
 }
 
 function habitStats(habit, timezoneOffset = 3) {
-  const days = daysSince(habit.quitDate, timezoneOffset);
-  const savedUnits = Math.round(days * (habit.dailyAmount || 0));
-  const savedMoney = estimateSavedMoney(habit, days);
+  ensureHabitTimestamps(habit, timezoneOffset);
+  const elapsed = getElapsed(habit);
+  const days = elapsed.days;
+  const progressDays = elapsed.progressDays;
+  const savedUnits = Math.round(progressDays * (habit.dailyAmount || 0));
+  const savedMoney = estimateSavedMoney(habit, progressDays);
   const relapseCount = habit.relapses?.length || 0;
   const currentStreak = days;
   const bestStreak = Math.max(currentStreak, habit.bestStreak || 0);
@@ -598,27 +695,108 @@ function habitStats(habit, timezoneOffset = 3) {
     saveState();
   }
 
-  return { days, savedUnits, savedMoney, relapseCount, currentStreak, bestStreak };
+  return { days, hours: elapsed.hours, minutes: elapsed.minutes, progressDays, savedUnits, savedMoney, relapseCount, currentStreak, bestStreak, elapsed };
 }
 
-function estimateSavedMoney(habit, days) {
-  if (!habit.unitCost) return 0;
-  if (habit.type === "smoking") {
-    const packs = (days * (habit.dailyAmount || 20)) / 20;
-    return Math.round(packs * habit.unitCost);
+function ensureHabitTimestamps(habit, timezoneOffset) {
+  if (!habit.quitAt && habit.quitDate) {
+    habit.quitAt = new Date(`${habit.quitDate}T00:00:00.000Z`).toISOString();
   }
-  return Math.round(days * habit.unitCost);
+  if (!habit.quitDate && habit.quitAt) {
+    habit.quitDate = habit.quitAt.slice(0, 10);
+  }
+}
+
+function getElapsed(habit) {
+  const start = new Date(habit.quitAt || habit.quitDate);
+  const ms = Math.max(0, Date.now() - start.getTime());
+  const days = Math.floor(ms / 86400000);
+  const hours = Math.floor((ms % 86400000) / 3600000);
+  const minutes = Math.floor((ms % 3600000) / 60000);
+  const progressDays = ms / 86400000;
+  return { ms, days, hours, minutes, progressDays, totalHours: ms / 3600000 };
+}
+
+function formatElapsed(elapsed) {
+  const parts = [];
+  if (elapsed.days > 0) parts.push(`**${elapsed.days}** ${pluralDays(elapsed.days)}`);
+  parts.push(`**${elapsed.hours}** ч`);
+  parts.push(`**${elapsed.minutes}** мин`);
+  return parts.join(" ");
+}
+
+function formatDateTime(value) {
+  if (!value) return "—";
+  if (String(value).includes("T")) {
+    const date = new Date(value);
+    const dd = String(date.getUTCDate()).padStart(2, "0");
+    const mm = String(date.getUTCMonth() + 1).padStart(2, "0");
+    const yyyy = date.getUTCFullYear();
+    const hh = String(date.getUTCHours()).padStart(2, "0");
+    const min = String(date.getUTCMinutes()).padStart(2, "0");
+    return `${dd}.${mm}.${yyyy} ${hh}:${min}`;
+  }
+  return formatDate(value);
+}
+
+function estimateSavedMoney(habit, progressDays) {
+  const perDay = getMoneyPerDay(habit);
+  if (!perDay) return 0;
+  return Math.round(progressDays * perDay);
+}
+
+function getMoneyPerDay(habit) {
+  if (habit.moneyPerDay != null && habit.moneyPerDay >= 0) return habit.moneyPerDay;
+  if (habit.type === "smoking" && habit.unitCost) {
+    return Math.round(((habit.dailyAmount || 20) / 20) * habit.unitCost);
+  }
+  return habit.unitCost || 0;
+}
+
+function suggestMoneyPerDay(preset, dailyAmount) {
+  if (preset.type === "smoking" && preset.unitCost) {
+    return Math.max(0, Math.round((dailyAmount / 20) * preset.unitCost));
+  }
+  return preset.moneyPerDay ?? preset.unitCost ?? 0;
+}
+
+function pickSavingsIdea(amount, habitType) {
+  const tiers = SAVINGS_IDEAS?.by_amount || [];
+  const tier = tiers.find((t) => amount >= t.min && amount < t.max) || tiers[tiers.length - 1];
+  const typeIdeas = asArray(SAVINGS_IDEAS?.by_type?.[habitType] || SAVINGS_IDEAS?.by_type?.custom);
+  const ideas = [...asArray(tier?.ideas), ...typeIdeas];
+  return pickRandom(ideas.length ? ideas : ["что-то приятное для себя"]);
+}
+
+function formatSavingsBlock(habit, stats) {
+  const perDay = getMoneyPerDay(habit);
+  if (!perDay) return null;
+  const perHour = Math.max(1, Math.round(perDay / 24));
+  const idea = pickSavingsIdea(Math.max(stats.savedMoney, perDay), habit.type);
+  return [
+    `💰 **Сэкономлено:** ~**${stats.savedMoney} ₽** за ${formatElapsed(stats.elapsed)}`,
+    `📊 Было **${perDay} ₽/день** · копится ~**${perHour} ₽/час**`,
+    `💡 **На это можно:** ${idea}`
+  ].join("\n");
 }
 
 function habitsText(userId) {
   const user = state.users[userId];
   if (!user.habits.length) return "Список пуст. Добавь первую привычку 👇";
-  return user.habits
-    .map((habit) => {
+  return [
+    "📋 **Твои привычки:**",
+    "",
+    ...user.habits.map((habit) => {
       const stats = habitStats(habit, user.timezoneOffset);
-      return `${habit.emoji} ${habit.name} — ${stats.days} ${pluralDays(stats.days)}`;
-    })
-    .join("\n");
+      return `${habit.emoji} ${habit.name} — ${stats.days} ${pluralDays(stats.days)} ${stats.hours} ч ${stats.minutes} мин`;
+    }),
+    "",
+    "🗑 Чтобы **удалить** — нажми кнопку с корзиной или **🗑 Удалить** в меню."
+  ].join("\n");
+}
+
+function deleteHabitIntroText() {
+  return "🗑 **Удалить привычку**\n\nВыбери, какую убрать из трекера.\nСтатистика по ней будет удалена без восстановления.";
 }
 
 function settingsText(userId) {
@@ -666,8 +844,10 @@ function helpText() {
     "/motivation — мотивация сейчас",
     "/urge — сильное желание, SOS-помощь",
     "/habits — список привычек",
+    "/delete — удалить привычку",
     "/relapse — сорвался, обнулить счётчик",
     "/articles — статьи по привычкам",
+    "/links — радио, музыка, донат",
     "/settings — напоминания и часовой пояс",
     "/help — эта справка",
     "",
@@ -702,29 +882,79 @@ function articleText(habit, section, timezoneOffset) {
   let text = block[section] || block.benefits;
   if (section === "savings") {
     const stats = habitStats(habit, timezoneOffset);
-    text += `\n\n📊 **Твоя статистика:** ~**${stats.savedMoney} ₽**`;
-    if (stats.savedUnits > 0) text += ` · **${stats.savedUnits}** ${habit.unitLabel}`;
-    text += ` за **${stats.days}** ${pluralDays(stats.days)}.`;
+    const savings = formatSavingsBlock(habit, stats);
+    if (savings) {
+      text += `\n\n${savings}`;
+    } else {
+      text += `\n\n📊 **Твой streak:** **${stats.days}** ${pluralDays(stats.days)} ${stats.hours} ч ${stats.minutes} мин без срыва.`;
+      if (stats.savedUnits > 0) {
+        text += `\n📉 Не потреблено: ~**${stats.savedUnits}** ${habit.unitLabel}.`;
+      }
+    }
   }
   return text;
 }
 
-function getSurvivalPercent(habitType, days) {
+function getSurvivalPercent(habitType, progressDays) {
   const table = ARTICLES.survival_percent[habitType] || ARTICLES.survival_percent.custom;
   const keys = Object.keys(table).map(Number).sort((a, b) => a - b);
-  let percent = table[String(keys[0])] || 50;
-  for (const key of keys) {
-    if (days >= key) percent = table[String(key)];
+  if (progressDays <= keys[0]) return table[String(keys[0])];
+  if (progressDays >= keys[keys.length - 1]) return table[String(keys[keys.length - 1])];
+
+  for (let i = 0; i < keys.length - 1; i += 1) {
+    const left = keys[i];
+    const right = keys[i + 1];
+    if (progressDays >= left && progressDays <= right) {
+      const leftVal = table[String(left)];
+      const rightVal = table[String(right)];
+      const ratio = (progressDays - left) / (right - left);
+      return Math.round(leftVal + (rightVal - leftVal) * ratio);
+    }
   }
-  return percent;
+  return table[String(keys[0])];
 }
 
-function percentileLine(habit, timezoneOffset) {
-  const stats = habitStats(habit, timezoneOffset);
-  if (stats.days === 0) return "🚀 **Старт сегодня** — каждый день без срыва поднимает тебя выше среднего.";
+function getRelapsePercent(habitType, progressDays) {
+  return clamp(100 - getSurvivalPercent(habitType, progressDays), 1, 99);
+}
+
+function relapseStatLine(habit, timezoneOffset) {
+  ensureHabitTimestamps(habit, timezoneOffset);
+  const elapsed = getElapsed(habit);
   const type = ARTICLES[habit.type] ? habit.type : "custom";
-  const percent = getSurvivalPercent(type, stats.days);
-  return `🏅 Ты держишься **лучше ~${percent}%** людей, которые пробуют бросить на этом этапе.`;
+
+  if (elapsed.ms < 60000) {
+    return "🚀 **Старт** — каждая минута без срыва уже победа.";
+  }
+
+  const relapse = getRelapsePercent(type, elapsed.progressDays);
+  const survive = 100 - relapse;
+
+  return [
+    `⏱ **Без срыва:** ${formatElapsed(elapsed)}`,
+    `📉 К этому моменту по статистике срываются **~${relapse}%** людей`,
+    `🏅 Ты держишься **лучше ~${survive}%** на этом этапе`
+  ].join("\n");
+}
+
+function linksIntroText() {
+  return [
+    "🎧 **Музыка для твоих побед и отдыха**",
+    "",
+    "Включай **Radio Gram** — когда нужен фон, драйв или просто выдохнуть.",
+    "",
+    "☕ А если бот помогает — можно угостить «безработного разработчика» 😄"
+  ].join("\n");
+}
+
+function linksKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: "📻 Онлайн радио Radio Gram", url: RADIO_GRAM_URL }],
+      [{ text: "🎵 Музыка для побед и отдыха", url: CHANNEL_URL }],
+      [{ text: "☕ Поддержать разработчика", url: SUPPORT_URL }]
+    ]
+  };
 }
 
 function pickImageName(habitType, slot) {
@@ -779,6 +1009,7 @@ function mainKeyboard() {
       [{ text: "📊 Прогресс" }, { text: "💬 Мотивация" }],
       [{ text: "🚨 SOS /urge" }, { text: "😔 Сорвался" }],
       [{ text: "📚 Статьи" }, { text: "➕ Добавить" }],
+      [{ text: "🎧 Радио & музыка" }, { text: "🗑 Удалить" }],
       [{ text: "⚙️ Настройки" }, { text: "❓ Помощь" }]
     ],
     resize_keyboard: true
@@ -792,6 +1023,7 @@ function statsKeyboard(userId) {
       [{ text: "📚 Статьи", callback_data: "article:menu" }],
       [{ text: "🚨 SOS", callback_data: "menu:urge" }],
       [{ text: "😔 Сорвался", callback_data: "menu:relapse" }],
+      [{ text: "🎧 Радио & музыка", callback_data: "menu:links" }],
       [{ text: "➕ Добавить привычку", callback_data: "add:menu" }]
     ]
   };
@@ -835,8 +1067,20 @@ function habitsKeyboard(userId) {
   const rows = user.habits.map((habit) => [
     { text: `🗑 ${habit.emoji} ${habit.name}`, callback_data: `remove:${habit.id}` }
   ]);
-  rows.push([{ text: "➕ Добавить", callback_data: "add:menu" }]);
+  rows.push(
+    [{ text: "➕ Добавить", callback_data: "add:menu" }],
+    [{ text: "← Главное меню", callback_data: "menu:main" }]
+  );
   return { inline_keyboard: rows };
+}
+
+function deleteConfirmKeyboard(habitId) {
+  return {
+    inline_keyboard: [
+      [{ text: "✅ Да, удалить", callback_data: `remove:confirm:${habitId}` }],
+      [{ text: "❌ Отмена", callback_data: "menu:habits" }]
+    ]
+  };
 }
 
 function addHabitKeyboard() {
@@ -844,6 +1088,8 @@ function addHabitKeyboard() {
     inline_keyboard: [
       [{ text: "🚭 Курение", callback_data: "add:smoking" }],
       [{ text: "🍷 Алкоголь", callback_data: "add:alcohol" }],
+      [{ text: "🧠 Онанизм / порно", callback_data: "add:masturbation" }],
+      [{ text: "🍔 Вредная еда", callback_data: "add:junkfood" }],
       [{ text: "🎯 Своя привычка", callback_data: "add:custom" }]
     ]
   };
@@ -905,7 +1151,7 @@ async function tickReminders() {
 
       const habit = pickRandom(user.habits);
       const motivation = pickMotivation(habit.type, slot, habit, user.timezoneOffset);
-      const caption = `🔔 ${slotLabel(slot)}\n\n${habit.emoji} ${habit.name}\n\n${motivation}\n\n${percentileLine(habit, user.timezoneOffset)}`;
+      const caption = `🔔 ${slotLabel(slot)}\n\n${habit.emoji} ${habit.name}\n\n${motivation}\n\n${relapseStatLine(habit, user.timezoneOffset)}`;
       try {
         await sendMotivationWithImage(user.chatId, caption, habit.type, slot, mainKeyboard());
       } catch (error) {
@@ -1073,6 +1319,10 @@ function cleanText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
 
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
 function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -1086,7 +1336,7 @@ async function runSelfTest() {
   console.log("\nMotivation morning:\n", pickMotivation("smoking", "morning", habit, 3));
   console.log("\nUrge:\n", pickMotivation("smoking", "urge", habit, 3));
   console.log("\nReplacement:\n", pickReplacement("smoking"));
-  console.log("\nPercentile:\n", percentileLine(habit, 3));
+  console.log("\nPercentile:\n", relapseStatLine(habit, 3));
   console.log("\nArticle:\n", articleText(habit, "benefits", 3).slice(0, 120) + "...");
   console.log("\nSelf-test OK");
 }

@@ -1,0 +1,11 @@
+{
+  "urge": { "label": "📻 Radio Gram — 10 минут без решений", "url": "https://player.radiogram.su/" },
+  "morning": { "label": "⚡ Утро · energy", "url": "https://t.me/gramradiochill" },
+  "evening": { "label": "🌿 Chill · вечер", "url": "https://player.radiogram.su/" },
+  "smoking": { "label": "🌿 Chill — легче без дыма", "url": "https://player.radiogram.su/" },
+  "alcohol": { "label": "🌊 Спокойный фон", "url": "https://player.radiogram.su/" },
+  "junkfood": { "label": "⚡ Энергия без сахара", "url": "https://t.me/gramradiochill" },
+  "masturbation": { "label": "🎧 Фокус и драйв", "url": "https://player.radiogram.su/" },
+  "custom": { "label": "🎵 Radio Gram", "url": "https://player.radiogram.su/" },
+  "general": { "label": "📻 Radio Gram — включай", "url": "https://player.radiogram.su/" }
+}

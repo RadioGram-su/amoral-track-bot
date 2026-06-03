@@ -8,6 +8,8 @@ const PORT = Number(process.env.PORT || 8788);
 const RADIO_GRAM_URL = process.env.RADIO_GRAM_URL || "https://player.radiogram.su/";
 const CHANNEL_URL = process.env.CHANNEL_URL || "https://t.me/gramradiochill";
 const SUPPORT_URL = process.env.SUPPORT_URL || "https://pay.cloudtips.ru/p/b5dba7c2";
+const TON_WALLET = process.env.TON_WALLET || "UQDNJZb6MPyqP1P1JONmZ5Que0_UMA1n4k3ugAYcVEv7XH3Q";
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || "2010814946";
 const SELF_TEST = process.argv.includes("--self-test");
 
 const DEFAULT_REMINDER_SLOTS = ["morning", "midday", "evening"];
@@ -27,7 +29,15 @@ const REPLACEMENTS = loadConfigJson("replacements.json");
 const ARTICLES = loadConfigJson("articles.json");
 const IMAGES_META = loadConfigJson("images.json");
 const SAVINGS_IDEAS = loadConfigJson("savings-ideas.json");
+const PLAYLISTS = loadConfigJson("playlists.json");
 const IMAGES_DIR = path.join(CONFIG_DIR, "images");
+const EXTRAS = require("./lib/extras");
+const ADMIN = require("./lib/admin-stats");
+const GAMIFICATION = require("./lib/gamification");
+const VISUAL = require("./lib/visual");
+const TONES = require("./lib/tones");
+const { supportKeyboard, moodKeyboard, proText } = require("./lib/bot-helpers");
+const METRICS = require("./lib/habit-metrics");
 
 const HABIT_PRESETS = {
   smoking: {
@@ -54,21 +64,24 @@ const HABIT_PRESETS = {
     type: "masturbation",
     name: "Онанизм / порно",
     emoji: "🧠",
+    trackMode: "time",
     dailyAmount: 1,
     unitLabel: "раз",
+    minutesPerDay: 30,
     unitCost: 0,
     moneyPerDay: 0,
-    costLabel: "₽/день"
+    costLabel: "мин/день"
   },
   junkfood: {
     type: "junkfood",
-    name: "Вредная еда",
+    name: "Питание / похудение",
     emoji: "🍔",
-    dailyAmount: 2,
-    unitLabel: "перекусов",
-    unitCost: 400,
-    moneyPerDay: 400,
-    costLabel: "₽/день"
+    trackMode: "weight",
+    dailyAmount: 0,
+    unitLabel: "кг",
+    unitCost: 0,
+    moneyPerDay: 0,
+    costLabel: "кг"
   }
 };
 
@@ -78,6 +91,8 @@ if (!BOT_TOKEN && !SELF_TEST) {
   console.error("Missing TELEGRAM_BOT_TOKEN. Create a bot via @BotFather and set the token.");
   process.exit(1);
 }
+
+assertDeployFiles();
 
 const telegramApi = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
@@ -123,7 +138,7 @@ async function handleUpdate(update) {
 
   const chatId = message.chat.id;
   const userId = String(message.from?.id || chatId);
-  ensureUser(userId, chatId);
+  touchUser(userId, chatId);
 
   if (!message.text) {
     await sendMessage(chatId, "Пиши текстом или используй кнопки ниже 👇", mainKeyboard());
@@ -141,11 +156,29 @@ async function handleUpdate(update) {
     "🗑 Удалить": "/delete",
     "🎧 Радио & музыка": "/links",
     "⚙️ Настройки": "/settings",
+    "📅 Календарь": "/calendar",
+    "🎲 Удача": "/luck",
+    "☕ Поддержать": "/support",
     "❓ Помощь": "/help"
   };
   if (keyboardMap[text]) text = keyboardMap[text];
 
   if (text.startsWith("/start")) {
+    const payload = text.split(/\s+/)[1];
+    if (payload?.startsWith("ch_")) {
+      const linked = linkChallengeBuddy(userId, payload.slice(3));
+      if (linked) {
+        await sendMessage(chatId, "👥 **Челлендж подключён!** Сравнивай streak: /buddy");
+      }
+    }
+    if (payload?.startsWith("ref_")) {
+      const refId = payload.slice(4);
+      if (refId && refId !== userId && state.users[refId]) {
+        state.users[refId].referralCount = Math.min(2, (state.users[refId].referralCount || 0) + 1);
+        saveState();
+        await sendMessage(chatId, "🎁 Спасибо другу! У него +1 заморозка streak в месяц.");
+      }
+    }
     await sendMessage(chatId, startText(userId), mainKeyboard());
     await sendMessage(chatId, linksIntroText(), linksKeyboard());
     return;
@@ -157,7 +190,29 @@ async function handleUpdate(update) {
   }
 
   if (text.startsWith("/stats") || text.startsWith("/progress")) {
-    await sendMessage(chatId, statsText(userId), statsKeyboard(userId));
+    await sendStatsWithImages(chatId, userId);
+    return;
+  }
+
+  if (text.startsWith("/weight")) {
+    const arg = text.replace(/^\/weight\s*/i, "").trim().replace(",", ".");
+    const kg = Number(arg);
+    const user = state.users[userId];
+    const weightHabits = (user.habits || []).filter((h) => METRICS.isWeightHabit(h));
+    if (!weightHabits.length) {
+      await sendMessage(chatId, "Сначала добавь привычку **Питание / похудение**.", addHabitKeyboard(userId));
+      return;
+    }
+    if (!arg || !Number.isFinite(kg) || kg < 30 || kg > 300) {
+      await sendMessage(chatId, "⚖️ Напиши: `/weight 75.5` — твой текущий вес в кг.", mainKeyboard());
+      return;
+    }
+    for (const h of weightHabits) {
+      if (h.startWeightKg == null) h.startWeightKg = kg;
+      h.currentWeightKg = Math.round(kg * 10) / 10;
+    }
+    saveState();
+    await sendStatsWithImages(chatId, userId);
     return;
   }
 
@@ -172,7 +227,7 @@ async function handleUpdate(update) {
   }
 
   if (text.startsWith("/add")) {
-    await sendMessage(chatId, "Выбери, от чего хочешь отказаться:", addHabitKeyboard());
+    await sendMessage(chatId, "Выбери, от чего хочешь отказаться:\n\n⚡ — быстрый старт с настройками по умолчанию", addHabitKeyboard(userId));
     return;
   }
 
@@ -204,6 +259,95 @@ async function handleUpdate(update) {
     return;
   }
 
+  if (text.startsWith("/edit")) {
+    await sendMessage(chatId, "✏️ Выбери привычку — изменю **₽/день**:", editHabitKeyboard(userId));
+    return;
+  }
+
+  if (text.startsWith("/goal")) {
+    state.users[userId].awaitingInput = { type: "savings_goal_title" };
+    saveState();
+    await sendMessage(chatId, "🎯 **На что копишь?**\nНапример: новые наушники, отпуск, курс\n\nНапиши название цели:");
+    return;
+  }
+
+  if (text.startsWith("/spent")) {
+    state.users[userId].awaitingInput = { type: "spent_saved_amount" };
+    saveState();
+    await sendMessage(chatId, "💸 **Потратил сэкономленное?**\nНапиши сумму в ₽ (я вычту из цели):");
+    return;
+  }
+
+  if (text.startsWith("/share")) {
+    await sendShareMenu(chatId, userId);
+    return;
+  }
+
+  if (text.startsWith("/freeze")) {
+    await useStreakFreeze(chatId, userId);
+    return;
+  }
+
+  if (text.startsWith("/buddy")) {
+    await sendMessage(chatId, buddyText(userId), mainKeyboard());
+    return;
+  }
+
+  if (text.startsWith("/challenge")) {
+    const arg = text.split(/\s+/)[1];
+    if (arg) {
+      const linked = linkChallengeBuddy(userId, arg.toUpperCase());
+      await sendMessage(
+        chatId,
+        linked ? "👥 **Друг подключён!** /buddy — сравнение streak" : "Код не найден. Попроси друга прислать свой /challenge",
+        mainKeyboard()
+      );
+    } else {
+      const code = ensureChallengeCode(state.users[userId]);
+      saveState();
+      await sendMessage(
+        chatId,
+        `👥 **Челлендж с другом**\n\nТвой код: \`${code}\`\n\nДруг пишет:\n/challenge ${code}\n\nРеферал (+заморозка):\n\`?start=ref_${userId}\``,
+        mainKeyboard()
+      );
+    }
+    return;
+  }
+
+  if (text.startsWith("/adminstats")) {
+    if (!ADMIN.isAdmin(userId, ADMIN_CHAT_ID)) return;
+    await sendMessage(chatId, adminStatsText());
+    return;
+  }
+
+  if (text.startsWith("/calendar")) {
+    const days = GAMIFICATION.isPro(state.users[userId]) ? 30 : 14;
+    await sendMessage(chatId, GAMIFICATION.calendarText(state.users[userId], (h) => habitStats(h, state.users[userId].timezoneOffset), state.users[userId].timezoneOffset, days), mainKeyboard());
+    return;
+  }
+
+  if (text.startsWith("/luck")) {
+    await sendDailyLuck(chatId, userId);
+    return;
+  }
+
+  if (text.startsWith("/vacation")) {
+    GAMIFICATION.startVacation(state.users[userId], 3);
+    saveState();
+    await sendMessage(chatId, "🏖 **Режим отдыха 3 дня**\n\nБез упреков. Напоминания мягче. Streak на месте.\n\n/urge и SOS — как обычно.", mainKeyboard());
+    return;
+  }
+
+  if (text.startsWith("/pro")) {
+    await sendMessage(chatId, proText(state.users[userId], GAMIFICATION.isPro), mainKeyboard());
+    return;
+  }
+
+  if (text.startsWith("/support") || text.startsWith("/donate")) {
+    await sendSupportMenu(chatId);
+    return;
+  }
+
   if (state.users[userId].awaitingInput) {
     await handleAwaitingInput(userId, chatId, text);
     return;
@@ -220,7 +364,7 @@ async function handleCallback(callback) {
   const data = callback.data || "";
   const chatId = callback.message.chat.id;
   const userId = String(callback.from.id);
-  ensureUser(userId, chatId);
+  touchUser(userId, chatId);
 
   if (data === "menu:links") {
     await answerCallback(callback.id);
@@ -236,7 +380,7 @@ async function handleCallback(callback) {
 
   if (data === "menu:stats") {
     await answerCallback(callback.id);
-    await sendMessage(chatId, statsText(userId), statsKeyboard(userId));
+    await sendStatsWithImages(chatId, userId);
     return;
   }
 
@@ -277,9 +421,156 @@ async function handleCallback(callback) {
   }
 
   if (data.startsWith("add:")) {
-    const type = data.split(":")[1];
+    const parts = data.split(":");
+    const type = parts[1] === "quick" ? parts[2] : parts[1];
     await answerCallback(callback.id);
+    if (parts[1] === "quick") {
+      await beginQuickAddHabit(userId, chatId, type);
+      return;
+    }
     await beginAddHabit(userId, chatId, type);
+    return;
+  }
+
+  if (data.startsWith("edit:")) {
+    const habitId = data.split(":")[1];
+    if (habitId === "menu") {
+      await answerCallback(callback.id);
+      await sendMessage(chatId, "✏️ Выбери привычку:", editHabitKeyboard(userId));
+      return;
+    }
+    const habit = getHabit(userId, habitId);
+    await answerCallback(callback.id);
+    if (!habit) return;
+    if (METRICS.isTimeHabit(habit)) {
+      state.users[userId].awaitingInput = { type: "edit_minutes", habitId };
+      saveState();
+      await sendMessage(
+        chatId,
+        `${habit.emoji} **${habit.name}**\n\nСейчас **${METRICS.getMinutesPerDay(habit)} мин/день**.\nНапиши новое число минут:`
+      );
+      return;
+    }
+    if (METRICS.isWeightHabit(habit)) {
+      state.users[userId].awaitingInput = { type: "edit_weight", habitId };
+      saveState();
+      const wp = METRICS.weightProgress(habit);
+      await sendMessage(
+        chatId,
+        `${habit.emoji} **${habit.name}**\n\nВес: **${wp?.current ?? "—"}** кг · цель **${wp?.target ?? "—"}** кг\n\nНапиши: \`текущий цель\` (например \`78 72\`) или только вес: \`78\``
+      );
+      return;
+    }
+    state.users[userId].awaitingInput = { type: "edit_money", habitId };
+    saveState();
+    await sendMessage(
+      chatId,
+      `${habit.emoji} **${habit.name}**\n\nСейчас **${getMoneyPerDay(habit)} ₽/день**.\nНапиши новую сумму:`
+    );
+    return;
+  }
+
+  if (data.startsWith("share:")) {
+    const habitId = data.split(":")[1];
+    if (habitId === "menu") {
+      await answerCallback(callback.id);
+      await sendShareMenu(chatId, userId);
+      return;
+    }
+    const habit = getHabit(userId, habitId);
+    await answerCallback(callback.id);
+    if (!habit) return;
+    const stats = habitStats(habit, state.users[userId].timezoneOffset);
+    const cap = `${shareStreakCard(habit, stats)}\n\n_Перешли другу — это победа._`;
+    await sendBannerBuffer(chatId, "share", cap, mainKeyboard());
+    return;
+  }
+
+  if (data.startsWith("trigger:")) {
+    const [, habitId, triggerId] = data.split(":");
+    const habit = getHabit(userId, habitId);
+    if (habit?.relapses?.length) {
+      habit.relapses[habit.relapses.length - 1].trigger = triggerId;
+      saveState();
+    }
+    await answerCallback(callback.id, "Записал");
+    await sendMessage(chatId, "Спасибо за честность — это поможет заметить паттерн.", mainKeyboard());
+    return;
+  }
+
+  if (data === "timer:start") {
+    const user = state.users[userId];
+    const habit = user.habits.length ? pickRandom(user.habits) : null;
+    user.activeTimer = {
+      habitId: habit?.id || null,
+      endsAt: Date.now() + 10 * 60 * 1000
+    };
+    saveState();
+    await answerCallback(callback.id, "10 минут");
+    const playlist = pickPlaylist(habit?.type || "general", "urge");
+    await sendBannerBuffer(
+      chatId,
+      "sos",
+      `⏱ **10 минут без решений**\n\n_${TONES.pickTone("sos")}_\n\n📻 ${playlist.label}`,
+      {
+        inline_keyboard: [[{ text: playlist.label, url: playlist.url }]]
+      }
+    );
+    await sendMessage(
+      chatId,
+      "Желание часто проходит за это время. Дыши, включи музыку.\n\nНапишу, когда время выйдет — спрошу «как сейчас?»",
+      mainKeyboard()
+    );
+    return;
+  }
+
+  if (data === "freeze:use") {
+    await answerCallback(callback.id);
+    await useStreakFreeze(chatId, userId);
+    return;
+  }
+
+  if (data === "toggle_quiet") {
+    const user = state.users[userId];
+    user.quietHours = user.quietHours || { enabled: false, start: 23, end: 8 };
+    user.quietHours.enabled = !user.quietHours.enabled;
+    saveState();
+    await answerCallback(callback.id);
+    await sendMessage(chatId, settingsText(userId), settingsKeyboard(userId));
+    return;
+  }
+
+  if (data === "toggle_digest") {
+    const user = state.users[userId];
+    user.digestEvening = user.digestEvening === false;
+    saveState();
+    await answerCallback(callback.id);
+    await sendMessage(chatId, settingsText(userId), settingsKeyboard(userId));
+    return;
+  }
+
+  if (data.startsWith("mood:")) {
+    const mood = data.split(":")[1];
+    GAMIFICATION.recordMood(state.users[userId], mood);
+    saveState();
+    await answerCallback(callback.id, "Спасибо");
+    const stat = GAMIFICATION.moodStats(state.users[userId]);
+    await sendMessage(chatId, stat ? `${stat}\n\n_Данные помогают видеть прогресс._` : "Записал.", mainKeyboard());
+    return;
+  }
+
+  if (data === "menu:support") {
+    await answerCallback(callback.id);
+    await sendSupportMenu(chatId);
+    return;
+  }
+
+  if (data.startsWith("set_tz:")) {
+    const offset = Number(data.split(":")[1]);
+    state.users[userId].timezoneOffset = offset;
+    saveState();
+    await answerCallback(callback.id, `Часовой пояс: UTC${offset >= 0 ? "+" : ""}${offset}`);
+    await sendMessage(chatId, settingsText(userId), settingsKeyboard(userId));
     return;
   }
 
@@ -363,13 +654,10 @@ async function handleCallback(callback) {
     const prevDays = habitStats(habit, state.users[userId].timezoneOffset).days;
     logRelapse(userId, habitId);
     await answerCallback(callback.id, "Счётчик обнулён");
-    await sendMotivationWithImage(
-      chatId,
-      relapseSupportText(userId, habitId, prevDays),
-      habit.type,
-      "urge",
-      mainKeyboard()
-    );
+    const supportCaption = relapseSupportText(userId, habitId, prevDays);
+    await sendBannerBuffer(chatId, "relapse", `${supportCaption}\n\n🎭 _${TONES.pickTone("relapse")}_`, mainKeyboard());
+    await sendBannerBuffer(chatId, "start", `🔄 **Новый старт:** ${habit.emoji} **${habit.name}**\n\nСегодня — день один.`, mainKeyboard());
+    await sendMessage(chatId, "🔍 **Что стало триггером?**", triggerKeyboard(habitId));
     return;
   }
 
@@ -393,15 +681,6 @@ async function handleCallback(callback) {
   if (data === "replace:more") {
     await answerCallback(callback.id);
     await sendReplacement(chatId, userId);
-    return;
-  }
-
-  if (data.startsWith("set_tz:")) {
-    const offset = Number(data.split(":")[1]);
-    state.users[userId].timezoneOffset = offset;
-    saveState();
-    await answerCallback(callback.id, `Часовой пояс: UTC${offset >= 0 ? "+" : ""}${offset}`);
-    await sendMessage(chatId, settingsText(userId), settingsKeyboard(userId));
     return;
   }
 
@@ -434,20 +713,244 @@ async function handleAwaitingInput(userId, chatId, text) {
 
   if (pending.type === "custom_unit_cost") {
     const moneyPerDay = Math.max(0, Number(text.replace(",", ".")) || 0);
-    addHabit(userId, {
-      type: "custom",
+    state.users[userId].awaitingInput = {
+      type: "custom_why_quit",
       name: pending.name,
-      emoji: "🎯",
       dailyAmount: pending.dailyAmount,
-      moneyPerDay,
-      unitCost: moneyPerDay,
-      unitLabel: "раз",
-      costLabel: "₽/день"
-    });
+      moneyPerDay
+    };
+    saveState();
+    await sendMessage(chatId, "💬 **Почему ты бросаешь?**\n1–2 предложения — напомню в трудный момент.\n\nИли напиши «пропустить».");
+    return;
+  }
+
+  if (pending.type === "custom_why_quit") {
+    const whyQuit = text.toLowerCase() === "пропустить" ? "" : cleanText(text).slice(0, 200);
+    state.users[userId].awaitingInput = {
+      type: "letter_to_self",
+      flow: "custom",
+      name: pending.name,
+      dailyAmount: pending.dailyAmount,
+      moneyPerDay: pending.moneyPerDay,
+      whyQuit
+    };
+    saveState();
+    await sendMessage(chatId, "✉️ **Письмо себе** — напишу в SOS.\n1–3 предложения от **сегодняшнего** тебя **будущему**.\n\nИли «пропустить».");
+    return;
+  }
+
+  if (pending.type === "letter_to_self") {
+    const letterToSelf = text.toLowerCase() === "пропустить" ? "" : cleanText(text).slice(0, 400);
+    if (!canAddHabit(userId)) {
+      state.users[userId].awaitingInput = null;
+      saveState();
+      await sendMessage(chatId, proGateText(), mainKeyboard());
+      return;
+    }
+    if (pending.flow === "custom") {
+      addHabit(userId, {
+        type: "custom",
+        name: pending.name,
+        emoji: "🎯",
+        dailyAmount: pending.dailyAmount,
+        moneyPerDay: pending.moneyPerDay,
+        unitCost: pending.moneyPerDay,
+        unitLabel: "раз",
+        costLabel: "₽/день",
+        whyQuit: pending.whyQuit,
+        letterToSelf
+      });
+    } else if (pending.flow === "quick") {
+      const preset = HABIT_PRESETS[pending.presetType];
+      addHabit(userId, {
+        ...preset,
+        dailyAmount: preset.dailyAmount,
+        moneyPerDay: preset.moneyPerDay,
+        unitCost: preset.unitCost,
+        minutesPerDay: pending.minutesPerDay ?? preset.minutesPerDay,
+        startWeightKg: pending.startWeightKg,
+        currentWeightKg: pending.currentWeightKg ?? pending.startWeightKg,
+        targetWeightKg: pending.targetWeightKg,
+        trackMode: preset.trackMode,
+        whyQuit: pending.whyQuit,
+        letterToSelf
+      });
+    } else {
+      addHabit(userId, {
+        ...HABIT_PRESETS[pending.presetType],
+        dailyAmount: pending.dailyAmount,
+        moneyPerDay: pending.moneyPerDay,
+        unitCost: pending.moneyPerDay,
+        minutesPerDay: pending.minutesPerDay,
+        startWeightKg: pending.startWeightKg,
+        currentWeightKg: pending.currentWeightKg,
+        targetWeightKg: pending.targetWeightKg,
+        trackMode: pending.trackMode,
+        whyQuit: pending.whyQuit,
+        letterToSelf
+      });
+    }
     state.users[userId].awaitingInput = null;
     saveState();
-    const moneyLine = moneyPerDay ? `\n💰 Расход: **${moneyPerDay} ₽/день**` : "";
-    await sendMessage(chatId, `✅ Добавлено: **${pending.name}**${moneyLine}\n\n${statsText(userId)}`, mainKeyboard());
+    await onHabitAdded(chatId, userId);
+    return;
+  }
+
+  if (pending.type === "edit_money") {
+    const moneyPerDay = Math.max(0, Number(text.replace(",", ".")) || 0);
+    const habit = getHabit(userId, pending.habitId);
+    if (habit) {
+      habit.moneyPerDay = moneyPerDay;
+      habit.unitCost = moneyPerDay;
+      saveState();
+    }
+    state.users[userId].awaitingInput = null;
+    saveState();
+    await sendStatsWithImages(chatId, userId);
+    return;
+  }
+
+  if (pending.type === "savings_goal_title") {
+    const title = cleanText(text).slice(0, 60);
+    if (!title) {
+      await sendMessage(chatId, "Напиши название цели текстом.");
+      return;
+    }
+    state.users[userId].awaitingInput = { type: "savings_goal_amount", title };
+    saveState();
+    await sendMessage(chatId, `🎯 **${title}**\n\nНа какую сумму копишь? (₽)`);
+    return;
+  }
+
+  if (pending.type === "savings_goal_amount") {
+    const targetAmount = Math.max(1, Math.round(Number(text.replace(",", ".")) || 0));
+    state.users[userId].savingsGoal = {
+      title: pending.title,
+      targetAmount,
+      spentAmount: state.users[userId].savingsGoal?.spentAmount || 0
+    };
+    state.users[userId].awaitingInput = null;
+    saveState();
+    await sendMessage(chatId, `✅ Цель: **${pending.title}** — **${targetAmount} ₽**\n\nПрогресс в /stats · потратил — /spent`, mainKeyboard());
+    return;
+  }
+
+  if (pending.type === "spent_saved_amount") {
+    const amount = Math.max(0, Math.round(Number(text.replace(",", ".")) || 0));
+    const user = state.users[userId];
+    if (user.savingsGoal) {
+      user.savingsGoal.spentAmount = (user.savingsGoal.spentAmount || 0) + amount;
+    }
+    state.users[userId].awaitingInput = null;
+    saveState();
+    const goalLine = user.savingsGoal ? `\n\n${goalProgress(user, totalSavedMoney(userId))?.line || ""}` : "";
+    await sendMessage(chatId, `💸 Записал **${amount} ₽** из сэкономленного.${goalLine}`, mainKeyboard());
+    await maybeSendSavingsBanner(chatId, userId);
+    return;
+  }
+
+  if (pending.type === "quick_weight") {
+    const kg = Number(text.replace(",", "."));
+    if (!Number.isFinite(kg) || kg < 30 || kg > 300) {
+      await sendMessage(chatId, "Напиши вес в кг, например **80**");
+      return;
+    }
+    state.users[userId].awaitingInput = {
+      type: "quick_why_quit",
+      presetType: pending.presetType,
+      startWeightKg: Math.round(kg * 10) / 10,
+      currentWeightKg: Math.round(kg * 10) / 10
+    };
+    saveState();
+    await sendMessage(chatId, "💬 **Почему меняешь питание?** (или «пропустить»)");
+    return;
+  }
+
+  if (pending.type === "quick_why_quit") {
+    const whyQuit = text.toLowerCase() === "пропустить" ? "" : cleanText(text).slice(0, 200);
+    if (!canAddHabit(userId)) {
+      state.users[userId].awaitingInput = null;
+      saveState();
+      await sendMessage(chatId, proGateText(), mainKeyboard());
+      return;
+    }
+    state.users[userId].awaitingInput = {
+      type: "letter_to_self",
+      flow: "quick",
+      presetType: pending.presetType,
+      whyQuit,
+      startWeightKg: pending.startWeightKg,
+      currentWeightKg: pending.currentWeightKg,
+      minutesPerDay: pending.minutesPerDay
+    };
+    saveState();
+    await sendMessage(chatId, "✉️ **Письмо себе** — пришлю в SOS.\n1–3 предложения. Или «пропустить».");
+    return;
+  }
+
+  if (pending.type === "preset_minutes_per_day") {
+    const normalized = text.toLowerCase();
+    const parsed = Number(text.replace(",", "."));
+    const minutesPerDay = normalized === "ок" || normalized === "ok"
+      ? pending.defaultMinutes
+      : Math.max(5, Math.round(parsed || pending.defaultMinutes));
+    state.users[userId].awaitingInput = {
+      type: "preset_why_quit",
+      presetType: pending.presetType,
+      dailyAmount: 1,
+      minutesPerDay,
+      trackMode: "time"
+    };
+    saveState();
+    const preset = HABIT_PRESETS[pending.presetType];
+    await sendMessage(
+      chatId,
+      `${preset.emoji} **${preset.name}** · **${minutesPerDay} мин/день**\n\n💬 **Почему хочешь контролировать?**\nНапомню в SOS. Или «пропустить».`
+    );
+    return;
+  }
+
+  if (pending.type === "preset_weight_current") {
+    const kg = Number(text.replace(",", "."));
+    if (!Number.isFinite(kg) || kg < 30 || kg > 300) {
+      await sendMessage(chatId, "Напиши вес в кг (30–300), например **82.5**");
+      return;
+    }
+    state.users[userId].awaitingInput = {
+      type: "preset_weight_target",
+      presetType: pending.presetType,
+      startWeightKg: Math.round(kg * 10) / 10
+    };
+    saveState();
+    await sendMessage(chatId, `🎯 **Цель веса** в кг? (меньше текущего)\nНапиши число или «пропустить».`);
+    return;
+  }
+
+  if (pending.type === "preset_weight_target") {
+    const normalized = text.toLowerCase();
+    let targetWeightKg = null;
+    if (normalized !== "пропустить" && normalized !== "skip") {
+      const kg = Number(text.replace(",", "."));
+      if (Number.isFinite(kg) && kg >= 30 && kg < pending.startWeightKg) {
+        targetWeightKg = Math.round(kg * 10) / 10;
+      }
+    }
+    state.users[userId].awaitingInput = {
+      type: "preset_why_quit",
+      presetType: pending.presetType,
+      dailyAmount: 0,
+      trackMode: "weight",
+      startWeightKg: pending.startWeightKg,
+      currentWeightKg: pending.startWeightKg,
+      targetWeightKg
+    };
+    saveState();
+    const preset = HABIT_PRESETS[pending.presetType];
+    const goalLine = targetWeightKg ? ` · цель **${targetWeightKg}** кг` : "";
+    await sendMessage(
+      chatId,
+      `${preset.emoji} **${preset.name}** · **${pending.startWeightKg}** кг${goalLine}\n\n💬 **Почему меняешь питание?** Или «пропустить».`
+    );
     return;
   }
 
@@ -463,7 +966,8 @@ async function handleAwaitingInput(userId, chatId, text) {
       type: "preset_money_per_day",
       presetType: pending.presetType,
       dailyAmount,
-      defaultMoney
+      defaultMoney,
+      trackMode: "money"
     };
     saveState();
     await sendMessage(
@@ -479,21 +983,75 @@ async function handleAwaitingInput(userId, chatId, text) {
     const moneyPerDay = normalized === "ок" || normalized === "ok"
       ? pending.defaultMoney
       : Math.max(0, parsed || pending.defaultMoney);
-    addHabit(userId, {
-      ...HABIT_PRESETS[pending.presetType],
+    state.users[userId].awaitingInput = {
+      type: "preset_why_quit",
+      presetType: pending.presetType,
       dailyAmount: pending.dailyAmount,
       moneyPerDay,
-      unitCost: moneyPerDay
-    });
-    state.users[userId].awaitingInput = null;
+      trackMode: "money"
+    };
     saveState();
     const preset = HABIT_PRESETS[pending.presetType];
-    const habit = getHabitByType(userId, preset.type);
     await sendMessage(
       chatId,
-      `✅ **${preset.name}** — старт!\n💰 Расход: **${moneyPerDay} ₽/день**\n\n${statsText(userId)}\n\n${pickMotivation(preset.type, "morning", habit, state.users[userId].timezoneOffset)}`,
-      mainKeyboard()
+      `${preset.emoji} **${preset.name}** · **${moneyPerDay} ₽/день**\n\n💬 **Почему ты бросаешь?**\nНапомню в SOS. Или «пропустить».`
     );
+    return;
+  }
+
+  if (pending.type === "edit_minutes") {
+    const minutesPerDay = Math.max(5, Math.round(Number(text.replace(",", ".")) || 0));
+    const habit = getHabit(userId, pending.habitId);
+    if (habit) {
+      habit.minutesPerDay = minutesPerDay;
+      habit.trackMode = "time";
+      saveState();
+    }
+    state.users[userId].awaitingInput = null;
+    saveState();
+    await sendStatsWithImages(chatId, userId);
+    return;
+  }
+
+  if (pending.type === "edit_weight") {
+    const parts = text.replace(",", ".").split(/\s+/).map(Number).filter((n) => Number.isFinite(n));
+    const habit = getHabit(userId, pending.habitId);
+    if (habit && parts.length >= 1) {
+      habit.currentWeightKg = Math.round(parts[0] * 10) / 10;
+      if (habit.startWeightKg == null) habit.startWeightKg = habit.currentWeightKg;
+      if (parts.length >= 2) habit.targetWeightKg = Math.round(parts[1] * 10) / 10;
+      habit.trackMode = "weight";
+      saveState();
+    }
+    state.users[userId].awaitingInput = null;
+    saveState();
+    await sendStatsWithImages(chatId, userId);
+    return;
+  }
+
+  if (pending.type === "preset_why_quit") {
+    const whyQuit = text.toLowerCase() === "пропустить" ? "" : cleanText(text).slice(0, 200);
+    if (!canAddHabit(userId)) {
+      state.users[userId].awaitingInput = null;
+      saveState();
+      await sendMessage(chatId, proGateText(), mainKeyboard());
+      return;
+    }
+    state.users[userId].awaitingInput = {
+      type: "letter_to_self",
+      flow: "preset",
+      presetType: pending.presetType,
+      dailyAmount: pending.dailyAmount,
+      moneyPerDay: pending.moneyPerDay,
+      minutesPerDay: pending.minutesPerDay,
+      trackMode: pending.trackMode,
+      startWeightKg: pending.startWeightKg,
+      currentWeightKg: pending.currentWeightKg,
+      targetWeightKg: pending.targetWeightKg,
+      whyQuit
+    };
+    saveState();
+    await sendMessage(chatId, "✉️ **Письмо себе** — пришлю в SOS.\n1–3 предложения. Или «пропустить».");
     return;
   }
 
@@ -501,8 +1059,49 @@ async function handleAwaitingInput(userId, chatId, text) {
   saveState();
 }
 
+async function beginQuickAddHabit(userId, chatId, type) {
+  const preset = HABIT_PRESETS[type];
+  if (!preset) {
+    await sendMessage(chatId, "Неизвестный тип.", addHabitKeyboard(userId));
+    return;
+  }
+  if (!canAddHabit(userId)) {
+    await sendMessage(chatId, proGateText(), mainKeyboard());
+    return;
+  }
+  if (getHabitByType(userId, type)) {
+    await sendMessage(chatId, `${preset.emoji} ${preset.name} уже добавлено.`, mainKeyboard());
+    return;
+  }
+  if (type === "junkfood") {
+    state.users[userId].awaitingInput = { type: "quick_weight", presetType: type };
+    saveState();
+    await sendMessage(chatId, `⚡ **${preset.name}**\n\n⚖️ Сколько весишь сейчас? (кг)`);
+    return;
+  }
+  if (type === "masturbation") {
+    state.users[userId].awaitingInput = { type: "quick_why_quit", presetType: type, minutesPerDay: 30 };
+    saveState();
+    await sendMessage(
+      chatId,
+      `⚡ **${preset.name}**\n\nПо умолчанию **30 мин/день** — изменишь в /edit\n\n💬 **Почему хочешь контролировать?** (или «пропустить»)`
+    );
+    return;
+  }
+  state.users[userId].awaitingInput = { type: "quick_why_quit", presetType: type };
+  saveState();
+  await sendMessage(
+    chatId,
+    `⚡ **Быстрый старт:** ${preset.emoji} ${preset.name}\n\nПо умолчанию ~${preset.dailyAmount} ${preset.unitLabel}/день · **${preset.moneyPerDay} ₽/день**\n\n💬 **Почему бросаешь?** (или «пропустить»)\n\n_Сумму потом изменишь: /edit_`
+  );
+}
+
 async function beginAddHabit(userId, chatId, type) {
   if (type === "custom") {
+    if (!canAddHabit(userId)) {
+      await sendMessage(chatId, proGateText(), mainKeyboard());
+      return;
+    }
     state.users[userId].awaitingInput = { type: "custom_habit_name" };
     saveState();
     await sendMessage(chatId, "Напиши название привычки, от которой отказываешься.\nНапример: сладкое, соцсети, азартные игры.");
@@ -517,6 +1116,31 @@ async function beginAddHabit(userId, chatId, type) {
 
   if (getHabitByType(userId, type)) {
     await sendMessage(chatId, `${preset.emoji} ${preset.name} уже добавлено. Смотри /stats`, mainKeyboard());
+    return;
+  }
+  if (!canAddHabit(userId)) {
+    await sendMessage(chatId, proGateText(), mainKeyboard());
+    return;
+  }
+
+  if (type === "masturbation") {
+    state.users[userId].awaitingInput = {
+      type: "preset_minutes_per_day",
+      presetType: type,
+      defaultMinutes: preset.minutesPerDay || 30
+    };
+    saveState();
+    await sendMessage(
+      chatId,
+      `${preset.emoji} **${preset.name}**\n\n⏳ **Сколько минут в день** уходит на это?\n(Не деньги — время. По умолчанию **30** — напиши число или «ок».)`
+    );
+    return;
+  }
+
+  if (type === "junkfood") {
+    state.users[userId].awaitingInput = { type: "preset_weight_current", presetType: type };
+    saveState();
+    await sendMessage(chatId, `${preset.emoji} **${preset.name}**\n\n⚖️ **Сколько весишь сейчас?** (кг)`);
     return;
   }
 
@@ -537,20 +1161,30 @@ function addHabit(userId, config) {
   const user = state.users[userId];
   const id = config.type === "custom" ? `custom-${Date.now()}` : config.type;
   const nowIso = new Date().toISOString();
-  user.habits.push({
+  const existing = user.habits.find((h) => h.id === id);
+  const base = {
     id,
     type: config.type,
     name: config.name,
     emoji: config.emoji || "🎯",
     quitDate: todayKey(user.timezoneOffset),
     quitAt: nowIso,
-    dailyAmount: config.dailyAmount || 1,
+    dailyAmount: config.dailyAmount ?? HABIT_PRESETS[config.type]?.dailyAmount ?? 1,
     moneyPerDay: config.moneyPerDay ?? config.unitCost ?? HABIT_PRESETS[config.type]?.moneyPerDay ?? 0,
     unitCost: config.unitCost ?? config.moneyPerDay ?? HABIT_PRESETS[config.type]?.unitCost ?? 0,
     unitLabel: config.unitLabel || HABIT_PRESETS[config.type]?.unitLabel || "раз",
-    relapses: [],
-    lastMotivationSlot: {}
-  });
+    whyQuit: config.whyQuit || "",
+    letterToSelf: config.letterToSelf || "",
+    relapses: existing?.relapses || [],
+    lastMotivationSlot: {},
+    lastMilestoneSent: 0,
+    bestStreak: 0,
+    lastStreakBannerSent: 0
+  };
+  const habit = METRICS.mergeHabitConfig(base, config);
+  const idx = user.habits.findIndex((h) => h.id === id);
+  if (idx >= 0) user.habits[idx] = habit;
+  else user.habits.push(habit);
   saveState();
 }
 
@@ -563,10 +1197,13 @@ function removeHabit(userId, habitId) {
 function logRelapse(userId, habitId) {
   const habit = getHabit(userId, habitId);
   if (!habit) return;
+  const stats = habitStats(habit, state.users[userId].timezoneOffset);
+  habit.bestStreak = Math.max(habit.bestStreak || 0, stats.days);
   habit.relapses.push({ at: new Date().toISOString() });
   const nowIso = new Date().toISOString();
   habit.quitDate = todayKey(state.users[userId].timezoneOffset);
   habit.quitAt = nowIso;
+  habit.lastMilestoneSent = 0;
   saveState();
 }
 
@@ -588,7 +1225,7 @@ async function sendMotivation(chatId, userId, source) {
 
   const habit = pickRandom(user.habits);
   const slot = source === "manual" ? currentSlot(user.timezoneOffset) : source;
-  const motivation = pickMotivation(habit.type, slot, habit, user.timezoneOffset);
+  const motivation = pickMotivation(habit.type, slot, habit, user.timezoneOffset, user);
   const statsBlock = relapseStatLine(habit, user.timezoneOffset);
   const caption = `${habit.emoji} **${habit.name}**\n\n${motivation}\n\n${statsBlock}`;
   await sendMotivationWithImage(chatId, caption, habit.type, slot, mainKeyboard());
@@ -598,16 +1235,45 @@ async function sendUrgeHelp(chatId, userId) {
   const user = state.users[userId];
   const habit = user.habits.length ? pickRandom(user.habits) : null;
   const motivation = habit
-    ? pickMotivation(habit.type, "urge", habit, user.timezoneOffset)
+    ? pickMotivation(habit.type, "urge", habit, user.timezoneOffset, user)
     : pickFrom(MOTIVATION.general.urge);
   const replacement = pickReplacement(habit?.type || "general");
+  const whyLine = habit?.whyQuit ? `\n\n💬 **Твоя цель:** _${habit.whyQuit}_` : "";
+  const letterLine = habit?.letterToSelf ? `\n\n✉️ **Письмо себе:**\n_${habit.letterToSelf}_` : "";
+  const dayStory = habit ? `\n\n${EXTRAS.getDayStory(ARTICLES, habit.type, habitStats(habit, user.timezoneOffset).days)}` : "";
+  const playlist = pickPlaylist(habit?.type || "general", "urge");
+  const tone = TONES.pickTone("sos");
 
-  const caption = `🚨 **Сильное желание — это нормально.**\n\n${motivation}\n\n🔄 **Замени привычку на:**\n${replacement}`;
-  await sendMotivationWithImage(chatId, caption, habit?.type || "general", "urge", {
+  await sendBannerBuffer(
+    chatId,
+    "sos",
+    `🚨 **Держись 10 минут**\n\n_${tone}_\n\n📻 ${playlist.label}`,
+    {
+      inline_keyboard: [
+        [{ text: playlist.label, url: playlist.url }],
+        [{ text: "⏱ Таймер 10 мин", callback_data: "timer:start" }]
+      ]
+    }
+  );
+
+  const caption = [
+    "**HALT — проверь себя:**",
+    "🍽 **H** — голоден? · 😤 **A** — злой? · 😔 **L** — один? · 😴 **T** — устал?",
+    "",
+    motivation,
+    whyLine,
+    letterLine,
+    dayStory,
+    "",
+    "🔄 **Замени привычку на:**",
+    replacement
+  ].join("\n");
+
+  await sendMessage(chatId, caption, {
     inline_keyboard: [
+      [{ text: "⏱ Таймер 10 мин", callback_data: "timer:start" }],
       [{ text: "🔄 Ещё замена", callback_data: "replace:more" }],
-      [{ text: "📊 Мой прогресс", callback_data: "menu:stats" }],
-      [{ text: "📚 Статьи", callback_data: "article:menu" }],
+      [{ text: "📊 Прогресс", callback_data: "menu:stats" }, { text: "📤 Поделиться", callback_data: habit ? `share:${habit.id}` : "menu:stats" }],
       [{ text: "😔 Сорвался", callback_data: "menu:relapse" }]
     ]
   });
@@ -622,7 +1288,7 @@ async function sendReplacement(chatId, userId) {
   });
 }
 
-function pickMotivation(habitType, slot, habit, timezoneOffset = 3) {
+function pickMotivation(habitType, slot, habit, timezoneOffset = 3, user = null) {
   const pool = [
     ...asArray(MOTIVATION[habitType]?.[slot]),
     ...asArray(MOTIVATION.general[slot]),
@@ -630,7 +1296,16 @@ function pickMotivation(habitType, slot, habit, timezoneOffset = 3) {
     ...asArray(MOTIVATION.general.urge)
   ].filter(Boolean);
 
-  let message = pickRandom(pool.length ? pool : ["💪 Ты держишься. Это главное."]);
+  let message;
+  if (user?.motivVariant === "b" && pool.length > 1) {
+    const half = Math.ceil(pool.length / 2);
+    message = pickRandom(pool.slice(half));
+  } else if (user?.motivVariant === "a" && pool.length > 1) {
+    message = pickRandom(pool.slice(0, Math.ceil(pool.length / 2)));
+  } else {
+    message = pickRandom(pool.length ? pool : ["💪 Ты держишься. Это главное."]);
+  }
+
   const stats = habitStats(habit, timezoneOffset);
 
   message = message
@@ -640,8 +1315,10 @@ function pickMotivation(habitType, slot, habit, timezoneOffset = 3) {
     .replaceAll("{elapsed}", formatElapsed(stats.elapsed))
     .replaceAll("{savingsIdea}", pickSavingsIdea(stats.savedMoney, habit.type));
 
-  const milestone = MOTIVATION[habitType]?.milestones?.[String(stats.days)];
-  if (milestone) message = `${milestone}\n\n${message}`;
+  const milestone = EXTRAS.checkMilestone(habit, stats, MOTIVATION);
+  if (milestone && stats.days !== habit.lastMilestoneSent) {
+    message = `${milestone}\n\n${message}`;
+  }
 
   return message;
 }
@@ -654,29 +1331,90 @@ function pickReplacement(habitType) {
   return pickRandom(pool);
 }
 
+function habitStatsBlockText(habit, user) {
+  const stats = habitStats(habit, user.timezoneOffset);
+  const streakCompare = stats.bestStreak > stats.currentStreak
+    ? `📈 До рекорда: **${stats.bestStreak - stats.currentStreak}** ${pluralDays(stats.bestStreak - stats.currentStreak)} · рекорд **${stats.bestStreak}**`
+    : stats.bestStreak === stats.currentStreak && stats.currentStreak > 0
+      ? "🏅 **Новый личный рекорд!**"
+      : null;
+  const triggers = EXTRAS.triggersSummary(habit);
+  const badges = GAMIFICATION.weeklyBadges(habit, stats);
+  const metricBlock = METRICS.formatHabitMetricBlock(habit, stats);
+  const tier = VISUAL.streakHoldTier(stats.days) + 1;
+  const safeDays = Number.isFinite(stats.days) ? stats.days : 0;
+
+  return [
+    `${habit.emoji} **${habit.name}** · этап **${tier}/10**`,
+    badges.length ? badges.join(" · ") : null,
+    habit.whyQuit ? `💬 _${habit.whyQuit}_` : null,
+    relapseStatLine(habit, user.timezoneOffset),
+    `⏱ **Держишься:** ${formatElapsed(stats.elapsed)}`,
+    `🔥 Streak: **${stats.currentStreak}** ${pluralDays(stats.currentStreak)} · лучший **${stats.bestStreak}**`,
+    streakCompare,
+    !METRICS.isWeightHabit(habit) ? EXTRAS.getDayStory(ARTICLES, habit.type, safeDays) : null,
+    metricBlock,
+    METRICS.isMoneyHabit(habit) && stats.savedUnits > 0
+      ? `📉 Не потреблено: ~**${stats.savedUnits}** ${habit.unitLabel}`
+      : null,
+    METRICS.isMoneyHabit(habit) ? formatSavingsBlock(habit, stats) : null,
+    triggers ? `🔍 Частые триггеры: ${triggers}` : null,
+    stats.relapseCount > 0 ? `⚠️ Срывов: ${stats.relapseCount}` : null,
+    `🗓 Старт: ${formatDateTime(habit.quitAt || habit.quitDate)}`
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function statsHeaderText(userId) {
+  const user = state.users[userId];
+  const levelLine = GAMIFICATION.levelLine(user, (h) => habitStats(h, user.timezoneOffset));
+  const moodLine = GAMIFICATION.moodStats(user);
+  return [levelLine, moodLine].filter(Boolean).join("\n");
+}
+
+function statsFooterText(userId) {
+  const user = state.users[userId];
+  const totalSaved = totalSavedMoney(userId);
+  const goal = goalProgress(user, totalSaved);
+  const globalLine = state.global?.holdingCount
+    ? `🌍 Сегодня держатся **~${state.global.holdingCount}** человек`
+    : "";
+  return [goal?.line, globalLine].filter(Boolean).join("\n\n");
+}
+
 function statsText(userId) {
   const user = state.users[userId];
   if (!user.habits.length) {
     return "Пока нет отслеживаемых привычек.\n\nДобавь курение, алкоголь или свою — и я буду считать дни и присылать мотивацию.";
   }
+  const blocks = user.habits.map((h) => habitStatsBlockText(h, user));
+  const header = statsHeaderText(userId);
+  const footer = statsFooterText(userId);
+  return [header, "", blocks.join("\n\n"), footer ? `\n\n${footer}` : ""].filter(Boolean).join("\n");
+}
 
-  return user.habits
-    .map((habit) => {
-      const stats = habitStats(habit, user.timezoneOffset);
-      return [
-        `${habit.emoji} **${habit.name}**`,
-        relapseStatLine(habit, user.timezoneOffset),
-        `🔥 Текущий streak: **${stats.currentStreak}** ${pluralDays(stats.currentStreak)}`,
-        `🏆 Лучший streak: **${stats.bestStreak}** ${pluralDays(stats.bestStreak)}`,
-        stats.savedUnits > 0 ? `📉 Не потреблено: ~**${stats.savedUnits}** ${habit.unitLabel}` : null,
-        formatSavingsBlock(habit, stats),
-        stats.relapseCount > 0 ? `⚠️ Срывов записано: ${stats.relapseCount}` : null,
-        `🗓 Старт цикла: ${formatDateTime(habit.quitAt || habit.quitDate)}`
-      ]
-        .filter(Boolean)
-        .join("\n");
-    })
-    .join("\n\n");
+async function sendStatsWithImages(chatId, userId) {
+  const user = state.users[userId];
+  if (!user.habits.length) {
+    await sendMessage(chatId, statsText(userId), addHabitKeyboard(userId));
+    return;
+  }
+  const header = statsHeaderText(userId);
+  if (header) await sendMessage(chatId, `📊 **Прогресс**\n\n${header}`);
+  for (const habit of user.habits) {
+    const stats = habitStats(habit, user.timezoneOffset);
+    const caption = habitStatsBlockText(habit, user);
+    const art = VISUAL.readStreakHoldBuffer(Number.isFinite(stats.days) ? stats.days : 0);
+    if (art) {
+      await sendPhotoFile(chatId, art, caption);
+    } else {
+      await sendMessage(chatId, caption);
+    }
+  }
+  const footer = statsFooterText(userId);
+  if (footer) await sendMessage(chatId, footer, statsKeyboard(userId));
+  else await sendMessage(chatId, "—", statsKeyboard(userId));
 }
 
 function habitStats(habit, timezoneOffset = 3) {
@@ -698,17 +1436,27 @@ function habitStats(habit, timezoneOffset = 3) {
   return { days, hours: elapsed.hours, minutes: elapsed.minutes, progressDays, savedUnits, savedMoney, relapseCount, currentStreak, bestStreak, elapsed };
 }
 
-function ensureHabitTimestamps(habit, timezoneOffset) {
+function ensureHabitTimestamps(habit, timezoneOffset = 3) {
   if (!habit.quitAt && habit.quitDate) {
     habit.quitAt = new Date(`${habit.quitDate}T00:00:00.000Z`).toISOString();
   }
   if (!habit.quitDate && habit.quitAt) {
     habit.quitDate = habit.quitAt.slice(0, 10);
   }
+  if (!habit.quitAt && !habit.quitDate) {
+    const nowIso = new Date().toISOString();
+    habit.quitAt = nowIso;
+    habit.quitDate = todayKey(timezoneOffset);
+    saveState();
+  }
 }
 
 function getElapsed(habit) {
   const start = new Date(habit.quitAt || habit.quitDate);
+  if (Number.isNaN(start.getTime())) {
+    const zero = { ms: 0, days: 0, hours: 0, minutes: 0, progressDays: 0, totalHours: 0 };
+    return zero;
+  }
   const ms = Math.max(0, Date.now() - start.getTime());
   const days = Math.floor(ms / 86400000);
   const hours = Math.floor((ms % 86400000) / 3600000);
@@ -718,10 +1466,13 @@ function getElapsed(habit) {
 }
 
 function formatElapsed(elapsed) {
+  const days = Number.isFinite(elapsed.days) ? elapsed.days : 0;
+  const hours = Number.isFinite(elapsed.hours) ? elapsed.hours : 0;
+  const minutes = Number.isFinite(elapsed.minutes) ? elapsed.minutes : 0;
   const parts = [];
-  if (elapsed.days > 0) parts.push(`**${elapsed.days}** ${pluralDays(elapsed.days)}`);
-  parts.push(`**${elapsed.hours}** ч`);
-  parts.push(`**${elapsed.minutes}** мин`);
+  if (days > 0) parts.push(`**${days}** ${pluralDays(days)}`);
+  parts.push(`**${hours}** ч`);
+  parts.push(`**${minutes}** мин`);
   return parts.join(" ");
 }
 
@@ -769,6 +1520,7 @@ function pickSavingsIdea(amount, habitType) {
 }
 
 function formatSavingsBlock(habit, stats) {
+  if (!METRICS.isMoneyHabit(habit)) return null;
   const perDay = getMoneyPerDay(habit);
   if (!perDay) return null;
   const perHour = Math.max(1, Math.round(perDay / 24));
@@ -804,13 +1556,23 @@ function settingsText(userId) {
   const slots = user.reminders.slots.length
     ? user.reminders.slots.map(slotLabel).join(", ")
     : "выключены";
+  const quiet = user.quietHours || { enabled: false, start: 23, end: 8 };
+  const freezeMonth = EXTRAS.monthKey(new Date(), user.timezoneOffset);
+  const allowance = GAMIFICATION.freezeAllowance(user, EXTRAS.monthKey, user.timezoneOffset);
+  const used = (user.freezeUsedMonths || []).filter((m) => m === freezeMonth).length;
+  const freezeLeft = `${Math.max(0, allowance - used)}/${allowance} в месяце${user.referralCount ? ` (+${Math.min(2, user.referralCount)} реф.)` : ""}`;
+  const vacationLine = GAMIFICATION.isOnVacation(user) ? "🏖 **Режим отдыха** активен" : null;
   return [
     "⚙️ **Настройки**",
+    vacationLine,
     `🔔 Напоминания: ${user.reminders.enabled ? "включены" : "выключены"}`,
     `🕐 Слоты: ${slots}`,
+    `🌙 Вечерний дайджест: ${user.digestEvening !== false ? "одним сообщением" : "как обычно"}`,
+    `🔕 Тихие часы (${quiet.start}:00–${quiet.end}:00): ${quiet.enabled ? "вкл" : "выкл"}`,
+    `❄️ Заморозка streak: ${freezeLeft}`,
     `🌍 Часовой пояс: UTC${user.timezoneOffset >= 0 ? "+" : ""}${user.timezoneOffset}`,
     "",
-    "Напоминания приходят 1 раз в выбранный слот, если ещё не отправляли сегодня."
+    "Напоминания приходят 1 раз в выбранный слот. Вечером — сводка по всем привычкам."
   ].join("\n");
 }
 
@@ -842,13 +1604,26 @@ function helpText() {
     "/start — главное меню",
     "/stats — прогресс и streak",
     "/motivation — мотивация сейчас",
-    "/urge — сильное желание, SOS-помощь",
+    "/urge — SOS: HALT, таймер, Radio Gram",
+    "/edit — ₽/день, минуты или вес",
+    "/weight — обновить вес (питание)",
+    "/goal — цель «коплю на…»",
+    "/spent — потратил сэкономленное",
+    "/share — карточка streak (картинка)",
+    "/calendar — emoji-календарь 14/30 дней",
+    "/luck — мотивация дня (1×/день)",
+    "/vacation — тихий режим отдыха 3 дня",
+    "/pro — Pro (Stars)",
+    "/support — TON + СБП",
+    "/freeze — заморозка streak (1×/мес + реф.)",
+    "/challenge — челлендж с другом",
+    "/buddy — сравнение с другом",
     "/habits — список привычек",
     "/delete — удалить привычку",
     "/relapse — сорвался, обнулить счётчик",
     "/articles — статьи по привычкам",
     "/links — радио, музыка, донат",
-    "/settings — напоминания и часовой пояс",
+    "/settings — напоминания, тихие часы",
     "/help — эта справка",
     "",
     "Кнопка **SOS** — когда накрывает прямо сейчас."
@@ -866,7 +1641,7 @@ function relapseSupportText(userId, habitId, prevDays = 0) {
     `${habit.emoji} **${habit.name}** — срыв записан.`,
     prevDays > 0 ? `📉 Streak **${prevDays}** ${pluralDays(prevDays)} обнулён. Новый старт: **сегодня**.` : "🔄 Счётчик обнулён. Новый старт: **сегодня**.",
     "",
-    pickMotivation(habit.type, "urge", habit, state.users[userId].timezoneOffset),
+    pickMotivation(habit.type, "urge", habit, state.users[userId].timezoneOffset, state.users[userId]),
     "",
     "💪 Один срыв не стирает весь путь. Ты уже знаешь, что можешь."
   ].join("\n");
@@ -880,6 +1655,10 @@ function articleText(habit, section, timezoneOffset) {
   const type = ARTICLES[habit.type] ? habit.type : "custom";
   const block = ARTICLES[type];
   let text = block[section] || block.benefits;
+  if (section === "withdrawal") {
+    const stats = habitStats(habit, timezoneOffset);
+    text += `\n\n${EXTRAS.getDayStory(ARTICLES, habit.type, stats.days)}`;
+  }
   if (section === "savings") {
     const stats = habitStats(habit, timezoneOffset);
     const savings = formatSavingsBlock(habit, stats);
@@ -952,7 +1731,8 @@ function linksKeyboard() {
     inline_keyboard: [
       [{ text: "📻 Онлайн радио Radio Gram", url: RADIO_GRAM_URL }],
       [{ text: "🎵 Музыка для побед и отдыха", url: CHANNEL_URL }],
-      [{ text: "☕ Поддержать разработчика", url: SUPPORT_URL }]
+      [{ text: "💎 TON-кошелёк", copy_text: { text: TON_WALLET } }],
+      [{ text: "💳 СБП · CloudTips", url: SUPPORT_URL }]
     ]
   };
 }
@@ -983,13 +1763,22 @@ async function sendMotivationWithImage(chatId, caption, habitType, slot, replyMa
   return sendMessage(chatId, caption, replyMarkup);
 }
 
-async function sendPhotoFile(chatId, imagePath, caption, replyMarkup) {
+async function sendPhotoFile(chatId, imagePathOrArt, caption, replyMarkup) {
   if (SELF_TEST) return sendMessage(chatId, caption, replyMarkup);
 
-  const buffer = fs.readFileSync(imagePath);
+  let buffer;
+  let filename;
+  if (imagePathOrArt && typeof imagePathOrArt === "object" && imagePathOrArt.buffer) {
+    buffer = imagePathOrArt.buffer;
+    filename = imagePathOrArt.filename || "banner.png";
+  } else {
+    buffer = fs.readFileSync(imagePathOrArt);
+    filename = path.basename(imagePathOrArt);
+  }
+
   const form = new FormData();
   form.append("chat_id", String(chatId));
-  form.append("photo", new Blob([buffer], { type: "image/jpeg" }), path.basename(imagePath));
+  form.append("photo", new Blob([buffer], { type: "image/png" }), filename);
   form.append("caption", caption.slice(0, 1024));
   form.append("parse_mode", "Markdown");
   if (replyMarkup) form.append("reply_markup", JSON.stringify(replyMarkup));
@@ -1003,6 +1792,129 @@ async function sendPhotoFile(chatId, imagePath, caption, replyMarkup) {
   return data;
 }
 
+async function sendBannerBuffer(chatId, kind, caption, replyMarkup) {
+  const art = VISUAL.readBannerBuffer(kind);
+  if (SELF_TEST || !art) return sendMessage(chatId, caption, replyMarkup);
+  return sendPhotoFile(chatId, art, caption, replyMarkup);
+}
+
+function canAddHabit(userId) {
+  const user = state.users[userId];
+  return (user.habits?.length || 0) < GAMIFICATION.freeHabitLimit(user);
+}
+
+function proGateText() {
+  return "⭐ **Free:** до **3** привычек.\n\n/pro — безлимит, все баннеры и календарь 30 дней.";
+}
+
+function pickPlaylist(habitType, slot) {
+  const typeCfg = PLAYLISTS[habitType];
+  if (typeCfg?.[slot]?.url) return typeCfg[slot];
+  if (PLAYLISTS[slot]?.url) return PLAYLISTS[slot];
+  if (typeCfg?.url) return typeCfg;
+  return PLAYLISTS.general;
+}
+
+async function sendSupportMenu(chatId) {
+  await sendMessage(
+    chatId,
+    "☕ **Поддержать A-Moral Track · Radio Gram**\n\nСпасибо, что бот помогает 💚",
+    supportKeyboard(SUPPORT_URL, TON_WALLET)
+  );
+}
+
+async function sendDailyLuck(chatId, userId) {
+  const user = state.users[userId];
+  const dayKey = todayKey(user.timezoneOffset);
+  if (user.lastLuckDay === dayKey) {
+    await sendMessage(chatId, "🎲 Уже крутил сегодня. Завтра — новая монетка!", mainKeyboard());
+    return;
+  }
+  user.lastLuckDay = dayKey;
+  saveState();
+  const pool = [...asArray(MOTIVATION.general?.morning), ...asArray(MOTIVATION.general?.evening)];
+  const quote = pickRandom(pool.length ? pool : ["💪 Ты держишься. Это главное."]);
+  const cap = `🎲 **Мотивация дня**\n\n${quote}\n\n_${TONES.pickTone("luck")}_`;
+  await sendBannerBuffer(chatId, "luck", cap, mainKeyboard());
+}
+
+async function onHabitAdded(chatId, userId, isRestart = false) {
+  const user = state.users[userId];
+  const habit = user.habits[user.habits.length - 1];
+  if (!habit) return;
+  const whyLine = habit.whyQuit ? `\n💬 _${habit.whyQuit}_` : "";
+  const cap = isRestart
+    ? `🔄 **Перезапуск** ${habit.emoji} **${habit.name}**\n\nСегодня — день один.${whyLine}`
+    : `🚀 **Старт!** ${habit.emoji} **${habit.name}**${whyLine}\n\n_${TONES.pickTone("general")}_`;
+  await sendBannerBuffer(chatId, "start", cap, mainKeyboard());
+  await sendStatsWithImages(chatId, userId);
+  const lvl = GAMIFICATION.checkLevelUp(user, (h) => habitStats(h, user.timezoneOffset));
+  saveState();
+  if (lvl.up) {
+    await sendBannerBuffer(
+      chatId,
+      "levelup",
+      `⭐ **Уровень ${lvl.level}**\n\nЗвание: **${lvl.title}** ${lvl.emoji}`,
+      mainKeyboard()
+    );
+  }
+}
+
+async function maybeSendStreakBanner(chatId, habit, stats) {
+  if (!EXTRAS.MILESTONE_DAYS.includes(stats.days)) return;
+  if (habit.lastStreakBannerSent === stats.days) return;
+  habit.lastStreakBannerSent = stats.days;
+  saveState();
+  await sendBannerBuffer(
+    chatId,
+    "streak",
+    `🔥 **${stats.days}** ${pluralDays(stats.days)} без срыва!\n\n${habit.emoji} **${habit.name}**`,
+    mainKeyboard()
+  );
+  if (stats.currentStreak === stats.bestStreak && stats.bestStreak >= 3) {
+    await sendBannerBuffer(
+      chatId,
+      "record",
+      `🏆 **Новый рекорд!**\n\n${habit.emoji} **${habit.name}** — **${stats.bestStreak}** ${pluralDays(stats.bestStreak)}`,
+      mainKeyboard()
+    );
+  }
+}
+
+async function maybeSendSavingsBanner(chatId, userId) {
+  const user = state.users[userId];
+  const totalSaved = totalSavedMoney(userId);
+  const goal = goalProgress(user, totalSaved);
+  if (!goal?.targetAmount && !user.savingsGoal?.targetAmount) return;
+  const prevPct = user.lastSavingsPct || 0;
+  const milestone = GAMIFICATION.checkSavingsMilestone(user, goal, prevPct);
+  user.lastSavingsPct = goal.pct;
+  saveState();
+  if (!milestone) return;
+  const left = Math.max(0, (user.savingsGoal?.targetAmount || 0) - goal.net);
+  const cap = milestone === 100
+    ? `🎯 **Цель достигнута!**\n\n**${user.savingsGoal.title}** — 100% 🎉`
+    : `💰 **${user.savingsGoal.title}** — **${milestone}%**\n\n${left > 0 ? `Ещё **${left} ₽**` : "Почти там!"}`;
+  await sendBannerBuffer(chatId, "savings", cap, mainKeyboard());
+}
+
+async function sendWeeklyReport(chatId, userId) {
+  await sendMessage(chatId, weeklyReportText(userId), mainKeyboard());
+  const user = state.users[userId];
+  const top = user.habits.reduce((best, h) => {
+    const days = habitStats(h, user.timezoneOffset).days;
+    return days > (best?.days || 0) ? { habit: h, days } : best;
+  }, null);
+  if (!top?.habit) return;
+  const stage = GAMIFICATION.getDayStage(top.days);
+  await sendBannerBuffer(
+    chatId,
+    "daystage",
+    `📅 **${stage.label}**\n\n${top.habit.emoji} **${top.habit.name}** · день **${top.days}**`,
+    mainKeyboard()
+  );
+}
+
 function mainKeyboard() {
   return {
     keyboard: [
@@ -1010,7 +1922,9 @@ function mainKeyboard() {
       [{ text: "🚨 SOS /urge" }, { text: "😔 Сорвался" }],
       [{ text: "📚 Статьи" }, { text: "➕ Добавить" }],
       [{ text: "🎧 Радио & музыка" }, { text: "🗑 Удалить" }],
-      [{ text: "⚙️ Настройки" }, { text: "❓ Помощь" }]
+      [{ text: "📅 Календарь" }, { text: "🎲 Удача" }],
+      [{ text: "⚙️ Настройки" }, { text: "☕ Поддержать" }],
+      [{ text: "❓ Помощь" }]
     ],
     resize_keyboard: true
   };
@@ -1019,11 +1933,11 @@ function mainKeyboard() {
 function statsKeyboard(userId) {
   return {
     inline_keyboard: [
+      [{ text: "📤 Поделиться streak", callback_data: "share:menu" }],
+      [{ text: "✏️ Изменить параметры", callback_data: "edit:menu" }],
+      [{ text: "❄️ Заморозка streak", callback_data: "freeze:use" }],
       [{ text: "💬 Мотивация", callback_data: "menu:motivation" }],
-      [{ text: "📚 Статьи", callback_data: "article:menu" }],
       [{ text: "🚨 SOS", callback_data: "menu:urge" }],
-      [{ text: "😔 Сорвался", callback_data: "menu:relapse" }],
-      [{ text: "🎧 Радио & музыка", callback_data: "menu:links" }],
       [{ text: "➕ Добавить привычку", callback_data: "add:menu" }]
     ]
   };
@@ -1083,13 +1997,17 @@ function deleteConfirmKeyboard(habitId) {
   };
 }
 
-function addHabitKeyboard() {
+function addHabitKeyboard(userId) {
   return {
     inline_keyboard: [
-      [{ text: "🚭 Курение", callback_data: "add:smoking" }],
-      [{ text: "🍷 Алкоголь", callback_data: "add:alcohol" }],
+      [
+        { text: "⚡ Курение", callback_data: "add:quick:smoking" },
+        { text: "⚡ Алкоголь", callback_data: "add:quick:alcohol" }
+      ],
+      [{ text: "🚭 Курение (настроить)", callback_data: "add:smoking" }],
+      [{ text: "🍷 Алкоголь (настроить)", callback_data: "add:alcohol" }],
       [{ text: "🧠 Онанизм / порно", callback_data: "add:masturbation" }],
-      [{ text: "🍔 Вредная еда", callback_data: "add:junkfood" }],
+      [{ text: "🍔 Питание / похудение", callback_data: "add:junkfood" }],
       [{ text: "🎯 Своя привычка", callback_data: "add:custom" }]
     ]
   };
@@ -1102,10 +2020,13 @@ function settingsKeyboard(userId) {
     text: `${user.reminders.slots.includes(slot) ? "✅" : "⬜"} ${slotLabel(slot)}`,
     callback_data: `toggle_slot:${slot}`
   }]);
+  const quiet = user.quietHours || { enabled: false };
 
   return {
     inline_keyboard: [
       [{ text: user.reminders.enabled ? "🔔 Выключить напоминания" : "🔕 Включить напоминания", callback_data: "toggle_reminders" }],
+      [{ text: user.digestEvening !== false ? "🌙 Дайджест: вкл" : "🌙 Дайджест: выкл", callback_data: "toggle_digest" }],
+      [{ text: quiet.enabled ? "🔕 Тихие часы: вкл" : "🔕 Тихие часы: выкл", callback_data: "toggle_quiet" }],
       ...slotRows,
       [
         { text: "UTC+2", callback_data: "set_tz:2" },
@@ -1137,23 +2058,82 @@ function startReminderLoop() {
 }
 
 async function tickReminders() {
+  state.global = state.global || {};
+  state.global.holdingCount = EXTRAS.countGlobalHolding(state);
+  state.global.updatedAt = new Date().toISOString();
+  saveState();
+
   for (const [userId, user] of Object.entries(state.users)) {
-    if (!user.reminders?.enabled || !user.chatId || !user.habits.length) continue;
+    if (!user.chatId) continue;
+
+    if (user.activeTimer?.endsAt && Date.now() >= user.activeTimer.endsAt) {
+      user.activeTimer = null;
+      saveState();
+      try {
+        await sendMessage(
+          user.chatId,
+          "✅ **10 минут прошло.**\n\nЖелание часто уже слабее. **Как сейчас?**",
+          moodKeyboard()
+        );
+      } catch (error) {
+        console.error(`Timer notify failed for ${userId}:`, error.message);
+      }
+    }
+
+    if (!user.reminders?.enabled || !user.habits.length) continue;
 
     const hour = currentHour(user.timezoneOffset);
+    const quiet = user.quietHours || { enabled: false, start: 23, end: 8 };
+    if (EXTRAS.isQuietHour(hour, quiet)) continue;
+
+    const dayKey = todayKey(user.timezoneOffset);
+    const isSunday = new Date(Date.now() + user.timezoneOffset * 3600000).getUTCDay() === 0;
+
+    if (isSunday && hour === 11 && user.lastWeeklyDigest !== EXTRAS.weekKey(new Date(), user.timezoneOffset)) {
+      user.lastWeeklyDigest = EXTRAS.weekKey(new Date(), user.timezoneOffset);
+      saveState();
+      try {
+        await sendWeeklyReport(user.chatId, userId);
+      } catch (error) {
+        console.error(`Weekly digest failed for ${userId}:`, error.message);
+      }
+    }
+
     for (const slot of user.reminders.slots || DEFAULT_REMINDER_SLOTS) {
       if (hour !== REMINDER_HOURS[slot]) continue;
-      if (user.lastReminderDate?.[slot] === todayKey(user.timezoneOffset)) continue;
+      if (user.lastReminderDate?.[slot] === dayKey) continue;
 
       user.lastReminderDate = user.lastReminderDate || {};
-      user.lastReminderDate[slot] = todayKey(user.timezoneOffset);
+      user.lastReminderDate[slot] = dayKey;
       saveState();
 
-      const habit = pickRandom(user.habits);
-      const motivation = pickMotivation(habit.type, slot, habit, user.timezoneOffset);
-      const caption = `🔔 ${slotLabel(slot)}\n\n${habit.emoji} ${habit.name}\n\n${motivation}\n\n${relapseStatLine(habit, user.timezoneOffset)}`;
       try {
-        await sendMotivationWithImage(user.chatId, caption, habit.type, slot, mainKeyboard());
+        if (slot === "evening" && user.digestEvening !== false) {
+          await sendMessage(user.chatId, eveningDigestText(userId), mainKeyboard());
+        } else {
+          const habit = pickRandom(user.habits);
+          const motivation = pickMotivation(habit.type, slot, habit, user.timezoneOffset, user);
+          const playlist = pickPlaylist(habit.type, slot);
+          const caption = `🔔 ${slotLabel(slot)}\n\n${habit.emoji} ${habit.name}\n\n${motivation}\n\n${relapseStatLine(habit, user.timezoneOffset)}\n\n📻 ${playlist.label}`;
+          await sendMotivationWithImage(user.chatId, caption, habit.type, slot, {
+            inline_keyboard: [
+              [{ text: playlist.label, url: playlist.url }],
+              [{ text: "← Меню", callback_data: "menu:main" }]
+            ]
+          });
+        }
+
+        for (const habit of user.habits) {
+          const stats = habitStats(habit, user.timezoneOffset);
+          const milestone = EXTRAS.checkMilestone(habit, stats, MOTIVATION);
+          if (milestone && habit.lastMilestoneSent !== stats.days) {
+            habit.lastMilestoneSent = stats.days;
+            saveState();
+            await sendMessage(user.chatId, `🎊 **Веха!**\n\n${habit.emoji} ${habit.name}\n\n${milestone}`, mainKeyboard());
+            await maybeSendStreakBanner(user.chatId, habit, stats);
+          }
+        }
+        await maybeSendSavingsBanner(user.chatId, userId);
       } catch (error) {
         console.error(`Reminder failed for ${userId}:`, error.message);
       }
@@ -1208,10 +2188,51 @@ function ensureUser(userId, chatId) {
       reminders: { enabled: true, slots: [...DEFAULT_REMINDER_SLOTS] },
       lastReminderDate: {},
       awaitingInput: null,
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      lastSeen: new Date().toISOString(),
+      quietHours: { enabled: false, start: 23, end: 8 },
+      digestEvening: true,
+      lastWeeklyDigest: null,
+      freezeUsedMonth: null,
+      challengeCode: null,
+      challengeBuddyId: null,
+      savingsGoal: null,
+      motivVariant: Math.random() < 0.5 ? "a" : "b",
+      activeTimer: null
     };
   }
-  if (chatId) state.users[userId].chatId = chatId;
+  const user = state.users[userId];
+  if (chatId) user.chatId = chatId;
+  user.quietHours = user.quietHours || { enabled: false, start: 23, end: 8 };
+  if (user.digestEvening == null) user.digestEvening = true;
+  if (!user.motivVariant) user.motivVariant = Math.random() < 0.5 ? "a" : "b";
+}
+
+function touchUser(userId, chatId) {
+  ensureUser(userId, chatId);
+  const user = state.users[userId];
+  ADMIN.touchActivity(user);
+  if (ADMIN.shouldPersistActivity(user)) {
+    ADMIN.markActivitySaved(user);
+    saveState();
+  }
+}
+
+function adminStatsText() {
+  const users = state.users || {};
+  const withHabits = Object.values(users).filter((u) => (u.habits || []).length > 0).length;
+  const withReminders = Object.values(users).filter((u) => u.reminders?.enabled).length;
+  const holding = state.global?.holdingCount || 0;
+  return ADMIN.buildAdminStats({
+    title: "A-Moral Track · admin",
+    users,
+    extraLines: [
+      "",
+      `🎯 С привычками: **${withHabits}**`,
+      `🔔 Напоминания вкл: **${withReminders}**`,
+      `🌍 Держатся сегодня: **~${holding}**`
+    ]
+  });
 }
 
 function getHabit(userId, habitId) {
@@ -1223,18 +2244,21 @@ function getHabitByType(userId, type) {
 }
 
 function loadState() {
-  if (!fs.existsSync(STATE_PATH)) return { users: {} };
+  if (!fs.existsSync(STATE_PATH)) return { users: {}, global: { holdingCount: 0 } };
   try {
     const parsed = JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
-    return { users: parsed.users || {} };
+    return {
+      users: parsed.users || parsed,
+      global: parsed.global || { holdingCount: 0 }
+    };
   } catch {
-    return { users: {} };
+    return { users: {}, global: { holdingCount: 0 } };
   }
 }
 
 function saveState() {
   fs.mkdirSync(path.dirname(STATE_PATH), { recursive: true });
-  fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
+  fs.writeFileSync(STATE_PATH, JSON.stringify({ users: state.users, global: state.global || {} }, null, 2));
 }
 
 function loadJson(filePath) {
@@ -1327,16 +2351,251 @@ function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function totalSavedMoney(userId) {
+  const user = state.users[userId];
+  return (user.habits || []).reduce((sum, habit) => sum + habitStats(habit, user.timezoneOffset).savedMoney, 0);
+}
+
+function goalProgress(user, totalSaved) {
+  return EXTRAS.goalProgress(user, totalSaved);
+}
+
+function shareStreakCard(habit, stats) {
+  return EXTRAS.shareStreakCard(habit, stats);
+}
+
+function ensureChallengeCode(user) {
+  if (!user.challengeCode) {
+    user.challengeCode = Math.random().toString(36).slice(2, 8).toUpperCase();
+  }
+  return user.challengeCode;
+}
+
+function linkChallengeBuddy(userId, code) {
+  const normalized = String(code || "").toUpperCase();
+  if (!normalized) return null;
+  ensureUser(userId);
+  for (const [otherId, other] of Object.entries(state.users)) {
+    if (otherId === userId) continue;
+    if (other.challengeCode === normalized) {
+      state.users[userId].challengeBuddyId = otherId;
+      other.challengeBuddyId = userId;
+      saveState();
+      return other;
+    }
+  }
+  return null;
+}
+
+function buddyText(userId) {
+  const user = state.users[userId];
+  if (!user.challengeBuddyId) {
+    return "👥 Пока нет друга в челлендже.\n\n/challenge — получить код\n/challenge КОД — подключиться";
+  }
+  const buddy = state.users[user.challengeBuddyId];
+  if (!buddy) return "Друг не найден. Попробуй подключиться снова: /challenge";
+  return EXTRAS.buddyCompare(user, buddy);
+}
+
+async function useStreakFreeze(chatId, userId) {
+  const user = state.users[userId];
+  if (!user.habits.length) {
+    await sendMessage(chatId, "Сначала добавь привычку.", addHabitKeyboard(userId));
+    return;
+  }
+  if (!GAMIFICATION.canUseFreeze(user, EXTRAS.monthKey, user.timezoneOffset)) {
+    const allowance = GAMIFICATION.freezeAllowance(user, EXTRAS.monthKey, user.timezoneOffset);
+    await sendMessage(
+      chatId,
+      `❄️ Заморозки на этот месяц исчерпаны (**${allowance}**/мес).\n\nПриведи друга: /start ref_${userId.slice(-6)} — бонус +1.`,
+      mainKeyboard()
+    );
+    return;
+  }
+  const habit = user.habits.reduce((best, h) => {
+    const days = habitStats(h, user.timezoneOffset).days;
+    return days > (best?.days || 0) ? { habit: h, days } : best;
+  }, null)?.habit || user.habits[0];
+  const start = new Date(habit.quitAt || habit.quitDate);
+  habit.quitAt = new Date(start.getTime() - 86400000).toISOString();
+  habit.quitDate = habit.quitAt.slice(0, 10);
+  GAMIFICATION.markFreezeUsed(user, EXTRAS.monthKey, user.timezoneOffset);
+  saveState();
+  const left = GAMIFICATION.freezeAllowance(user, EXTRAS.monthKey, user.timezoneOffset)
+    - (user.freezeUsedMonths || []).filter((m) => m === EXTRAS.monthKey(new Date(), user.timezoneOffset)).length;
+  await sendMessage(
+    chatId,
+    `❄️ **Заморозка применена**\n\n${habit.emoji} ${habit.name} — +1 день к streak.\n\nОсталось в месяце: **${left}**.`,
+    mainKeyboard()
+  );
+}
+
+function eveningDigestText(userId) {
+  const user = state.users[userId];
+  const lines = ["🌙 **Вечерний дайджест**", ""];
+  for (const habit of user.habits) {
+    const stats = habitStats(habit, user.timezoneOffset);
+    lines.push(`${habit.emoji} **${habit.name}** — ${formatElapsed(stats.elapsed)}`);
+    if (habit.whyQuit) lines.push(`💬 _${habit.whyQuit}_`);
+    lines.push(EXTRAS.getDayStory(ARTICLES, habit.type, stats.days));
+    lines.push("");
+  }
+  const goal = goalProgress(user, totalSavedMoney(userId));
+  if (goal) lines.push(goal.line);
+  if (state.global?.holdingCount) {
+    lines.push(`\n🌍 Сегодня держатся **~${state.global.holdingCount}** человек`);
+  }
+  return lines.join("\n");
+}
+
+function weeklyReportText(userId) {
+  const user = state.users[userId];
+  const weekAgo = Date.now() - 7 * 86400000;
+  const lines = ["📅 **Недельный отчёт**", ""];
+  let totalSaved = 0;
+  let relapsesWeek = 0;
+  for (const habit of user.habits) {
+    const stats = habitStats(habit, user.timezoneOffset);
+    totalSaved += stats.savedMoney;
+    const weekRelapses = (habit.relapses || []).filter((r) => new Date(r.at).getTime() >= weekAgo).length;
+    relapsesWeek += weekRelapses;
+    const badges = GAMIFICATION.weeklyBadges(habit, stats);
+    lines.push(
+      `${habit.emoji} **${habit.name}**`,
+      badges.length ? badges.join(" · ") : null,
+      `· streak **${stats.days}** дн. · рекорд **${stats.bestStreak}**`,
+      `· срывов за неделю: **${weekRelapses}**`,
+      `· сэкономлено ~**${stats.savedMoney} ₽**`,
+      ""
+    );
+  }
+  lines.push(`💰 Всего ~**${totalSaved} ₽** · срывов за неделю: **${relapsesWeek}**`);
+  const compare = GAMIFICATION.weekCompare(user, (h) => habitStats(h, user.timezoneOffset), user.timezoneOffset);
+  if (compare) lines.push("", compare);
+  saveState();
+  const wk = EXTRAS.weekKey(new Date(), user.timezoneOffset);
+  if (user.lastWhyReminder !== wk) {
+    user.lastWhyReminder = wk;
+    saveState();
+    const whyHabit = user.habits.find((h) => h.whyQuit);
+    if (whyHabit) lines.push("", `💬 **Ты обещал:** _${whyHabit.whyQuit}_`);
+  }
+  const goal = goalProgress(user, totalSaved);
+  if (goal) lines.push("", goal.line);
+  return lines.filter(Boolean).join("\n");
+}
+
+function editHabitKeyboard(userId) {
+  const user = state.users[userId];
+  if (!user.habits.length) {
+    return { inline_keyboard: [[{ text: "➕ Добавить", callback_data: "add:menu" }]] };
+  }
+  return {
+    inline_keyboard: user.habits.map((habit) => [
+      {
+        text: `${habit.emoji} ${habit.name} (${METRICS.isTimeHabit(habit) ? `${METRICS.getMinutesPerDay(habit)} мин` : METRICS.isWeightHabit(habit) ? `${habit.currentWeightKg ?? "—"} кг` : `${getMoneyPerDay(habit)} ₽`})`,
+        callback_data: `edit:${habit.id}`
+      }
+    ])
+  };
+}
+
+function triggerKeyboard(habitId) {
+  return {
+    inline_keyboard: [
+      [
+        { text: "☕ Кофе", callback_data: `trigger:${habitId}:coffee` },
+        { text: "😤 Стресс", callback_data: `trigger:${habitId}:stress` }
+      ],
+      [
+        { text: "😔 Один", callback_data: `trigger:${habitId}:alone` },
+        { text: "😴 Устал", callback_data: `trigger:${habitId}:tired` }
+      ],
+      [
+        { text: "🎉 Компания", callback_data: `trigger:${habitId}:party` },
+        { text: "❓ Другое", callback_data: `trigger:${habitId}:other` }
+      ],
+      [{ text: "Пропустить", callback_data: "menu:main" }]
+    ]
+  };
+}
+
+async function sendShareMenu(chatId, userId) {
+  const user = state.users[userId];
+  if (!user.habits.length) {
+    await sendMessage(chatId, "Сначала добавь привычку.", addHabitKeyboard(userId));
+    return;
+  }
+  if (user.habits.length === 1) {
+    const habit = user.habits[0];
+    const stats = habitStats(habit, user.timezoneOffset);
+    const cap = `${shareStreakCard(habit, stats)}\n\n_Перешли другу — это победа._`;
+    await sendBannerBuffer(chatId, "share", cap, mainKeyboard());
+    return;
+  }
+  await sendMessage(chatId, "📤 Выбери привычку для карточки:", {
+    inline_keyboard: user.habits.map((habit) => [
+      { text: `${habit.emoji} ${habit.name}`, callback_data: `share:${habit.id}` }
+    ])
+  });
+}
+
 async function runSelfTest() {
+  ensureUser("test-merge", 1);
+  addHabit("test-merge", {
+    ...HABIT_PRESETS.alcohol,
+    dailyAmount: 1,
+    moneyPerDay: 500,
+    unitCost: 500,
+    whyQuit: "тест"
+  });
+  const merged = state.users["test-merge"].habits[0];
+  if (!merged.quitAt || !merged.quitDate) {
+    throw new Error("mergeHabitConfig must preserve quitAt/quitDate");
+  }
+  const st = habitStats(merged, 3);
+  if (!Number.isFinite(st.days) || st.days > 1) {
+    throw new Error(`new habit must start at 0-1 days, got ${st.days}`);
+  }
+  if (VISUAL.streakHoldTier(st.days) !== 0) {
+    throw new Error(`new habit image tier must be 0, got ${VISUAL.streakHoldTier(st.days)}`);
+  }
+
   ensureUser("test", 1);
-  addHabit("test", { ...HABIT_PRESETS.smoking, dailyAmount: 15 });
+  addHabit("test", { ...HABIT_PRESETS.smoking, dailyAmount: 15, whyQuit: "Здоровье", letterToSelf: "Ты справишься." });
   const user = state.users.test;
   const habit = user.habits[0];
+  user.savingsGoal = { title: "Наушники", targetAmount: 5000, spentAmount: 0 };
+  console.log("Level:", GAMIFICATION.getLevel(user, (h) => habitStats(h, 3)));
+  console.log("Calendar:\n", GAMIFICATION.calendarText(user, (h) => habitStats(h, 3), 3, 14).slice(0, 120));
+  console.log("Tone:", TONES.pickTone("sos"));
+  console.log("Banner:", VISUAL.bannerPath("start") ? "OK" : "missing");
   console.log("Stats:\n", statsText("test"));
-  console.log("\nMotivation morning:\n", pickMotivation("smoking", "morning", habit, 3));
-  console.log("\nUrge:\n", pickMotivation("smoking", "urge", habit, 3));
-  console.log("\nReplacement:\n", pickReplacement("smoking"));
-  console.log("\nPercentile:\n", relapseStatLine(habit, 3));
-  console.log("\nArticle:\n", articleText(habit, "benefits", 3).slice(0, 120) + "...");
+  console.log("\nEvening digest:\n", eveningDigestText("test").slice(0, 200) + "...");
+  console.log("\nWeekly:\n", weeklyReportText("test").slice(0, 200) + "...");
+  console.log("\nShare:\n", shareStreakCard(habit, habitStats(habit, 3)));
   console.log("\nSelf-test OK");
+}
+
+function assertDeployFiles() {
+  const required = [
+    "lib/extras.js",
+    "lib/admin-stats.js",
+    "lib/gamification.js",
+    "lib/visual.js",
+    "lib/tones.js",
+    "lib/bot-helpers.js",
+    "lib/habit-metrics.js",
+    "config/tones.json",
+    "config/playlists.json",
+    "assets/alerts/start.png",
+    "assets/alerts/sos.png",
+    "assets/alerts/hold-01.png",
+    "assets/alerts/hold-10.png"
+  ];
+  const missing = required.filter((rel) => !fs.existsSync(path.join(ROOT_DIR, rel)));
+  if (missing.length) {
+    console.error("Missing deploy files:\n" + missing.map((f) => `  - ${f}`).join("\n"));
+    if (!SELF_TEST) process.exit(1);
+  }
 }

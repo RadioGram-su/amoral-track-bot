@@ -89,6 +89,22 @@ Rendering needs Node packages and a headless browser in the session; if the envi
 say so and fall back to Route A. Check `remotion-license` if the user's company is above the free-use
 threshold.
 
+## Route C: own 3D in Blender (no AI generators, rendered in the cloud)
+
+For users who want fully original art. Claude models, shades and renders the scene with Blender's
+Python API in the cloud container and sends the PNG/MP4 to the phone.
+
+- Setup: `apt-get install -y blender xvfb` (Ubuntu 24.04 ships Blender 4.0). Render headless with
+  `xvfb-run -a blender -b --factory-startup -P script.py -- OUTDIR`.
+- House style "Living Blueprint" (`scripts/blueprint_style_frames.py`): graph-paper background,
+  toon shading with 3 flat bands, halftone ink dots in shadows, Freestyle ink outlines, red hatched
+  section cuts, exploded views with dash-dot centre lines, numbered callouts, bilingual RU/EN overlays.
+  Mascot: Hex, a brass hex nut with one eye in the hole. Reuse the helpers (`toon`, `hatch`, `lathe`,
+  `cut`, `part`/`pose`, `label`, `title`) for every new object.
+- EEVEE + Freestyle renders a 1080×1920 frame in a few seconds on 4 CPUs; budget ~1 h CPU per 40 s clip.
+- User-made assets: the user can sculpt on Android (e.g. Nomad Sculpt) and send `.glb`; import with
+  `bpy.ops.import_scene.gltf` and apply the house materials.
+
 ## Quality checklist before posting
 
 - [ ] Hook in the first 1.5 s works with the sound off.

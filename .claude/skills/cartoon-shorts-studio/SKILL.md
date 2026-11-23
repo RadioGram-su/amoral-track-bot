@@ -101,6 +101,14 @@ Python API in the cloud container and sends the PNG/MP4 to the phone.
   section cuts, exploded views with dash-dot centre lines, numbered callouts, bilingual RU/EN overlays.
   Mascot: Hex, a brass hex nut with one eye in the hole. Reuse the helpers (`toon`, `hatch`, `lathe`,
   `cut`, `part`/`pose`, `label`, `title`) for every new object.
+- House style "Retro Console" (`scripts/ps1_game_style.py`), the user's chosen look: PS1/PS2-era low-poly
+  game. Flat-shaded 5-12 sided meshes, procedural 16-64 px textures with nearest filtering, posterised
+  vertex-style lighting, distance fog, bloom on pickups, blob shadows, HUD (level, hearts, counter),
+  RPG dialog box as subtitles, "LEVEL COMPLETE" end card. Render 360x640 with no anti-aliasing, animate
+  on twos (15 fps steps), then post with ffmpeg: `palettegen=max_colors=64` + `paletteuse=dither=bayer`,
+  `scale=1080:1920:flags=neighbor`, `drawgrid=w=iw:h=3:t=1:c=black@0.13` scanlines. ~1 s per frame.
+  Episode = game level: hook question as level title, collectible counter as the retention bar,
+  combo text on the wow beat, end card with a mystery item and "next level" teaser.
 - EEVEE + Freestyle renders a 1080×1920 frame in a few seconds on 4 CPUs; budget ~1 h CPU per 40 s clip.
 - User-made assets: the user can sculpt on Android (e.g. Nomad Sculpt) and send `.glb`; import with
   `bpy.ops.import_scene.gltf` and apply the house materials.

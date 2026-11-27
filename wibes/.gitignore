@@ -1,0 +1,8 @@
+output/
+screens/
+*.mp4
+*.mov
+*.wav
+*.mp3
+.env
+.env.*
